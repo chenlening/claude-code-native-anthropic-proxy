@@ -1,10 +1,10 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/anthropic-transparent-proxy/internal/endpoint"
@@ -143,9 +143,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		// 429 — close this response, decrement connection, record failure, try next backend
-		h.healthMgr.RecordFailure(ep, "429")
-		resp.Body.Close()
+		// 429 — read body for failure reason, close, decrement, record, try next backend
+		reason := fmt.Sprintf("status=429 body=%q", readBodyForReason(resp.Body))
+		h.healthMgr.RecordFailure(ep, reason)
 		ep.DecrementConnection(frontendModel)
 		h.logger.Warn("rate limited, retrying on next backend",
 			"endpoint", ep.Name, "attempt", attempt+1)
@@ -162,10 +162,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Record success/failure based on status code (all non-2xx are failures)
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300
+	var errBody []byte
 	if success {
 		h.healthMgr.RecordSuccess(selectedEp)
 	} else {
-		h.healthMgr.RecordFailure(selectedEp, strconv.Itoa(resp.StatusCode))
+		// Buffer error body for both failure reason and client response
+		errBody, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		reason := fmt.Sprintf("status=%d body=%q", resp.StatusCode, truncateString(string(errBody), 200))
+		h.healthMgr.RecordFailure(selectedEp, reason)
 	}
 
 	h.metrics.RecordRequest(frontendModel, selectedBackend.BackendModel, selectedEp.Name, time.Since(start).Seconds(), success)
@@ -181,18 +186,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream response body
-	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			w.Write(buf[:n])
-			if canFlush {
-				flusher.Flush()
+	if errBody != nil {
+		// Error response — write buffered body
+		w.Write(errBody)
+	} else {
+		// Success response — stream from upstream
+		flusher, canFlush := w.(http.Flusher)
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				w.Write(buf[:n])
+				if canFlush {
+					flusher.Flush()
+				}
 			}
-		}
-		if err != nil {
-			break
+			if err != nil {
+				break
+			}
 		}
 	}
 }
@@ -214,4 +225,19 @@ func (r *closingReader) Read(p []byte) (int, error) {
 
 func (r *closingReader) Close() error {
 	return nil
+}
+
+// readBodyForReason reads up to 200 bytes from body for failure reason logging.
+func readBodyForReason(body io.ReadCloser) string {
+	respBody, _ := io.ReadAll(io.LimitReader(body, 200))
+	body.Close()
+	return string(respBody)
+}
+
+// truncateString truncates s to at most maxLen bytes.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen]
 }

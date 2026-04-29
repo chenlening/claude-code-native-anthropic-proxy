@@ -2,13 +2,3 @@ bin/
 .DS_Store
 cover.out
 /proxy
-
-# Live config with real API keys — use proxy.yaml.example as template
-configs/proxy.yaml
-
-# Local Claude Code settings (may contain tokens)
-.claude/settings.local.json
-
-# Environment files
-.env
-.env.*
