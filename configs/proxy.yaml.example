@@ -1,0 +1,52 @@
+# configs/proxy.yaml.example
+server:
+  listen: ":8080"
+  read_timeout: 30s
+  write_timeout: 120s
+  idle_timeout: 90s
+
+logging:
+  level: info
+  format: json
+
+metrics:
+  enabled: true
+  path: /metrics
+
+health:
+  path: /health
+
+routing:
+  default_strategy: least-connections
+
+models:
+  claude-sonnet-4-20250514:
+    backends:
+      - endpoint: endpoint-a
+        model: "claude-sonnet-4-20250514"
+        weight: 10
+      - endpoint: endpoint-b
+        model: "custom-sonnet-model"
+        weight: 5
+
+  claude-opus-4-20250514:
+    backends:
+      - endpoint: endpoint-a
+        model: "claude-opus-4-20250514"
+        weight: 10
+
+endpoints:
+  endpoint-a:
+    url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"
+    timeout: 90s
+
+  endpoint-b:
+    url: "https://custom-provider.example.com/v1"
+    api_key: "${CUSTOM_PROVIDER_KEY}"
+    timeout: 90s
+
+endpoint_health:
+  failures_to_disable: 5
+  recovery_probe_interval: 30s
+  successes_to_enable: 2

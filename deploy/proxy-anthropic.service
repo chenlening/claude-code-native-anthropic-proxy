@@ -1,0 +1,18 @@
+[Unit]
+Description=Anthropic Transparent Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=nice
+Group=nice
+WorkingDirectory=/home/nice/chenlening/workspace/anthropic-transparent-proxy
+ExecStart=/home/nice/chenlening/workspace/anthropic-transparent-proxy/bin/proxy --config /home/nice/chenlening/workspace/anthropic-transparent-proxy/configs/proxy.yaml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=proxy-anthropic
+
+[Install]
+WantedBy=multi-user.target
