@@ -16,7 +16,7 @@ func TestHealthManagerRecordFailureDisablesEndpoint(t *testing.T) {
 		SuccessesToEnable:     2,
 	})
 
-	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
+	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
 	hm.AddEndpoint(ep)
 
 	for i := 0; i < 3; i++ {
@@ -35,7 +35,7 @@ func TestHealthManagerRecordFailureBelowThreshold(t *testing.T) {
 		SuccessesToEnable:     2,
 	})
 
-	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
+	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
 	hm.AddEndpoint(ep)
 
 	hm.RecordFailure(ep)
@@ -53,7 +53,7 @@ func TestHealthManagerRecordSuccessEnablesEndpoint(t *testing.T) {
 		SuccessesToEnable:     2,
 	})
 
-	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
+	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
 	hm.AddEndpoint(ep)
 
 	ep.Disable()
@@ -73,9 +73,9 @@ func TestHealthManagerGetHealthyEndpoints(t *testing.T) {
 		SuccessesToEnable:     2,
 	})
 
-	epA := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
-	epB := NewEndpointState("endpoint-b", "https://custom.com", "key")
-	epC := NewEndpointState("endpoint-c", "https://another.com", "key")
+	epA := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
+	epB := NewEndpointState("endpoint-b", "https://custom.com", "key", "")
+	epC := NewEndpointState("endpoint-c", "https://another.com", "key", "")
 
 	hm.AddEndpoint(epA)
 	hm.AddEndpoint(epB)
@@ -109,7 +109,7 @@ func TestHealthManagerIsEndpointHealthy(t *testing.T) {
 		SuccessesToEnable:     2,
 	})
 
-	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
+	ep := NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
 	hm.AddEndpoint(ep)
 
 	if !hm.IsEndpointHealthy(ep) {
@@ -135,7 +135,7 @@ func TestProbeDisabledEndpointsSetsProbeFields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ep := NewEndpointState("test-ep", server.URL, "key")
+	ep := NewEndpointState("test-ep", server.URL, "key", "")
 	hm.AddEndpoint(ep)
 
 	// Disable the endpoint
@@ -166,7 +166,7 @@ func TestProbeDisabledEndpointsRecordsFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ep := NewEndpointState("test-ep", server.URL, "key")
+	ep := NewEndpointState("test-ep", server.URL, "key", "")
 	hm.AddEndpoint(ep)
 
 	// Disable the endpoint
@@ -197,7 +197,7 @@ func TestProbeDisabledEndpointsRecordsRateLimitAsUnhealthy(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ep := NewEndpointState("test-ep", server.URL, "key")
+	ep := NewEndpointState("test-ep", server.URL, "key", "")
 	hm.AddEndpoint(ep)
 
 	// Disable the endpoint
@@ -235,7 +235,7 @@ func TestProbeDisabledEndpointsUsesProbeModel(t *testing.T) {
 	}))
 	defer server.Close()
 
-	ep := NewEndpointState("test-ep", server.URL, "key")
+	ep := NewEndpointState("test-ep", server.URL, "key", "")
 	ep.ProbeModel = "my-backend-model"
 	hm.AddEndpoint(ep)
 	ep.Disable()

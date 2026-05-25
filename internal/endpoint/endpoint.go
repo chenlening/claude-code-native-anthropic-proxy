@@ -11,10 +11,11 @@ import (
 
 // EndpointState holds runtime state for an endpoint
 type EndpointState struct {
-	Name   string
-	URL    string
-	APIKey string
-	Client *http.Client
+	Name            string
+	URL             string
+	ModelsEndpoint  string // Optional: custom URL for model discovery
+	APIKey          string
+	Client          *http.Client
 
 	// Mutable state protected by mutex
 	mu             sync.RWMutex
@@ -29,27 +30,42 @@ type EndpointState struct {
 	lastFailureReason string
 	lastRequestTime   time.Time
 
+	// Model discovery error tracking (separate from request failures)
+	lastDiscoveryError string
+	lastDiscoveryTime  time.Time
+
 	// Probe tracking
-	lastProbeTime   time.Time
+	lastProbeTime    time.Time
 	lastProbeSuccess bool
 	ProbeModel       string // Backend model name to use in health probes
+
+	// SupportedModels lists the models this endpoint supports
+	SupportedModels []string
 }
 
 // NewEndpointState creates a new endpoint state
-func NewEndpointState(name, url, apiKey string) *EndpointState {
+func NewEndpointState(name, url, apiKey, modelsEndpoint string) *EndpointState {
 	return &EndpointState{
-		Name:        name,
-		URL:         url,
-		APIKey:      apiKey,
-		Client:      &http.Client{Timeout: 90 * time.Second},
+		Name:           name,
+		URL:            url,
+		ModelsEndpoint: modelsEndpoint,
+		APIKey:         apiKey,
+		Client: &http.Client{
+			Timeout: 0,
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: 90 * time.Second,
+			},
+		},
 		connections: make(map[string]int64),
 	}
 }
 
-// WithTimeout sets the client timeout
+// WithTimeout sets the response header timeout on the transport
 func (e *EndpointState) WithTimeout(timeout time.Duration) *EndpointState {
 	e.mu.Lock()
-	e.Client.Timeout = timeout
+	if transport, ok := e.Client.Transport.(*http.Transport); ok {
+		transport.ResponseHeaderTimeout = timeout
+	}
 	e.mu.Unlock()
 	return e
 }
@@ -151,10 +167,12 @@ func (e *EndpointState) RecordFailure(reason ...string) {
 	}
 }
 
-// ResetFailures clears the failure count
+// ResetFailures clears the failure count and associated error info
 func (e *EndpointState) ResetFailures() {
 	e.mu.Lock()
 	e.failures = 0
+	e.lastFailureTime = time.Time{}
+	e.lastFailureReason = ""
 	e.mu.Unlock()
 }
 
@@ -237,4 +255,54 @@ func (e *EndpointState) ShouldEnable(threshold int) bool {
 	successes := e.successesSince
 	e.mu.RUnlock()
 	return successes >= int64(threshold)
+}
+
+// SetDiscoveryError records a model discovery error
+func (e *EndpointState) SetDiscoveryError(errMsg string) {
+	e.mu.Lock()
+	e.lastDiscoveryError = errMsg
+	e.lastDiscoveryTime = time.Now()
+	e.mu.Unlock()
+}
+
+// GetDiscoveryError returns the last model discovery error
+func (e *EndpointState) GetDiscoveryError() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastDiscoveryError
+}
+
+// GetDiscoveryTime returns when the last model discovery error occurred
+func (e *EndpointState) GetDiscoveryTime() time.Time {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lastDiscoveryTime
+}
+
+// SetSupportedModels sets the list of supported models
+func (e *EndpointState) SetSupportedModels(models []string) {
+	e.mu.Lock()
+	e.SupportedModels = models
+	e.mu.Unlock()
+}
+
+// GetSupportedModels returns a copy of the supported models list
+func (e *EndpointState) GetSupportedModels() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make([]string, len(e.SupportedModels))
+	copy(result, e.SupportedModels)
+	return result
+}
+
+// SupportsModel returns true if the endpoint supports the given model
+func (e *EndpointState) SupportsModel(model string) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, m := range e.SupportedModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
 }

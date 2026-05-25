@@ -7,6 +7,7 @@ Type=simple
 User=nice
 Group=nice
 WorkingDirectory=/home/nice/chenlening/workspace/anthropic-transparent-proxy
+Environment="PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/home/nice/chenlening/workspace/anthropic-transparent-proxy/bin/proxy --config /home/nice/chenlening/workspace/anthropic-transparent-proxy/configs/proxy.yaml
 Restart=on-failure
 RestartSec=5s

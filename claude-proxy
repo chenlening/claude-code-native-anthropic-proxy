@@ -1,0 +1,361 @@
+#!/bin/bash
+# Claude Code wrapper script for anthropic-transparent-proxy
+# Ensures Claude Code uses the proxy with health checks and validation
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Configuration
+PROXY_SERVICE="proxy-anthropic"
+CONFIG_FILE="configs/proxy.yaml"
+FALLBACK_CONFIG="/etc/anthropic-transparent-proxy/proxy.yaml"
+DEFAULT_BASE_URL="http://localhost:8080"
+TEMP_SETTINGS="/tmp/claude-proxy-settings-$$.json"
+
+# Cleanup trap
+cleanup() {
+    if [[ -f "$TEMP_SETTINGS" ]]; then
+        rm "$TEMP_SETTINGS"
+    fi
+}
+trap cleanup EXIT
+
+# Functions
+log_info() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1" >&2
+}
+
+log_warn() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+check_proxy_service() {
+    if ! systemctl is-active --quiet "$PROXY_SERVICE" 2>/dev/null; then
+        log_error "Proxy service not running"
+        echo ""
+        echo "Start the proxy service with:"
+        echo "  sudo systemctl start $PROXY_SERVICE"
+        echo ""
+        echo "Check service status:"
+        echo "  systemctl status $PROXY_SERVICE"
+        exit 1
+    fi
+    log_info "Proxy service: active ($PROXY_SERVICE)"
+}
+
+check_health_endpoint() {
+    local base_url="$1"
+    if ! curl -sf "$base_url/health" > /dev/null 2>&1; then
+        log_error "Proxy not responding at $base_url"
+        echo ""
+        echo "Troubleshooting:"
+        echo "  1. Check proxy logs: journalctl -u $PROXY_SERVICE -n 20"
+        echo "  2. Restart proxy: sudo systemctl restart $PROXY_SERVICE"
+        echo "  3. Verify config: $CONFIG_FILE"
+        exit 1
+    fi
+    log_info "Health endpoint: responding"
+}
+
+find_config_file() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "$CONFIG_FILE"
+    elif [[ -f "$FALLBACK_CONFIG" ]]; then
+        echo "$FALLBACK_CONFIG"
+    else
+        log_error "Configuration file not found"
+        echo ""
+        echo "Expected locations:"
+        echo "  1. $CONFIG_FILE"
+        echo "  2. $FALLBACK_CONFIG"
+        exit 1
+    fi
+}
+
+extract_api_key() {
+    local config_file="$1"
+    # Extract first non-offline endpoint's API key
+    grep -A 3 "endpoints:" "$config_file" | \
+    grep -A 2 "  [a-z]" | \
+    grep "api_key:" | \
+    head -1 | \
+    sed 's/.*api_key: *"\(.*\)"/\1/'
+}
+
+extract_base_url() {
+    local config_file="$1"
+    # Extract server listen address (format: ":8080" or "127.0.0.1:8080")
+    local listen_line=$(grep "listen:" "$config_file" | sed 's/.*listen: *"\(.*\)"/\1/')
+
+    # If listen starts with :, it means bind to all interfaces
+    if [[ "$listen_line" == :* ]]; then
+        local port="${listen_line#:}"
+        echo "http://localhost:$port"
+    elif [[ "$listen_line" == 0.0.0.0:* ]]; then
+        local port="${listen_line##*:}"
+        echo "http://localhost:$port"
+    elif [[ "$listen_line" == *:* ]]; then
+        # Format is host:port
+        echo "http://$listen_line"
+    else
+        echo "$DEFAULT_BASE_URL"
+    fi
+}
+
+extract_models() {
+    local base_url="$1"
+    # Fetch available models from the proxy's /v1/models endpoint
+    local models_json
+    models_json=$(curl -s "$base_url/v1/models" 2>/dev/null)
+
+    if [[ -z "$models_json" ]]; then
+        echo "unavailable (endpoint not responding)"
+        return
+    fi
+
+    # Check if response contains "data" array
+    if echo "$models_json" | jq -e '.data' > /dev/null 2>&1; then
+        # Extract first 5 model IDs and format them
+        local models
+        models=$(echo "$models_json" | jq -r '.data[].id' | head -5 | while read -r line; do echo -n "$line, "; done | sed 's/, $//')
+        local total_count
+        total_count=$(echo "$models_json" | jq -r '.data | length')
+        if [[ "$total_count" -gt 5 ]]; then
+            echo "$models, etc ($total_count total)"
+        else
+            echo "$models"
+        fi
+    else
+        echo "unavailable (unexpected response format)"
+    fi
+}
+
+# Interactive model selection with last-choice memory
+LAST_MODEL_FILE="$HOME/.claude-proxy-last"
+
+# Classify models as large (Opus/Sonnet) or small (Haiku) by naming patterns
+_is_small_model() {
+    [[ "$1" =~ flash|turbo|highspeed|air$|air-|-air|lite$|mini$|haiku ]]
+}
+
+select_models() {
+    local base_url="$1"
+
+    # Fetch models from proxy
+    local models_json
+    models_json=$(curl -s "$base_url/v1/models" 2>/dev/null)
+
+    if [[ -z "$models_json" ]] || ! echo "$models_json" | jq -e '.data' > /dev/null 2>&1; then
+        log_error "Failed to fetch models from proxy"
+        exit 1
+    fi
+
+    # Extract model IDs into an array
+    local model_ids
+    model_ids=($(echo "$models_json" | jq -r '.data[].id'))
+
+    if [[ ${#model_ids[@]} -eq 0 ]]; then
+        log_error "No models available"
+        exit 1
+    fi
+
+    # Read last selected models (if any)
+    local last_large=""
+    local last_small=""
+    if [[ -f "$LAST_MODEL_FILE" ]]; then
+        last_large=$(sed -n '1p' "$LAST_MODEL_FILE")
+        last_small=$(sed -n '2p' "$LAST_MODEL_FILE")
+    fi
+
+    # ── helpers ────────────────────────────────────────────────────────────
+
+    _tag() {
+        if _is_small_model "$1"; then echo "small"; else echo "large"; fi
+    }
+
+    _show_menu() {
+        local cat="$1" label="$2" last_val="$3"
+        local idx=1 recommended=1
+
+        echo "" >/dev/tty
+        echo "Select ${label}:" >/dev/tty
+        echo "" >/dev/tty
+
+        for m in "${model_ids[@]}"; do
+            local tag="$(_tag "$m")"
+            local mark=""
+            if [[ "$m" == "$last_val" ]]; then
+                mark=" (default)"
+                recommended=$idx
+            elif [[ "$tag" == "$cat" && $recommended -eq 1 ]]; then
+                recommended=$idx
+            fi
+            printf "  %2d) %s (%s)%s\n" "$idx" "$m" "$tag" "$mark" >/dev/tty
+            ((idx++))
+        done
+
+        echo "$recommended"
+    }
+
+    _choose() {
+        local v
+        read -r v </dev/tty
+        echo "$v"
+    }
+
+    # ── step 1: pick large model ───────────────────────────────────────────
+
+    local default_large
+    default_large=$(_show_menu large "large model (Opus / Sonnet)" "$last_large")
+
+    echo ""
+    printf "  Enter number [${default_large}]: "
+    local large_choice
+    large_choice=$(_choose)
+    large_choice="${large_choice:-$default_large}"
+
+    if [[ "$large_choice" =~ ^[0-9]+$ ]] && (( large_choice >= 1 && large_choice <= ${#model_ids[@]} )); then
+        SELECTED_LARGE="${model_ids[$((large_choice-1))]}"
+    else
+        SELECTED_LARGE="${model_ids[$((default_large-1))]}"
+    fi
+
+    # ── step 2: pick small model ───────────────────────────────────────────
+
+    local default_small
+    default_small=$(_show_menu small "small model (Haiku)" "$last_small")
+
+    echo ""
+    printf "  Enter number [${default_small}]: "
+    local small_choice
+    small_choice=$(_choose)
+    small_choice="${small_choice:-$default_small}"
+
+    if [[ "$small_choice" =~ ^[0-9]+$ ]] && (( small_choice >= 1 && small_choice <= ${#model_ids[@]} )); then
+        SELECTED_SMALL="${model_ids[$((small_choice-1))]}"
+    else
+        SELECTED_SMALL="${model_ids[$((default_small-1))]}"
+    fi
+
+    # ── summary ────────────────────────────────────────────────────────────
+
+    echo ""
+    log_info "Large: $SELECTED_LARGE  |  Small: $SELECTED_SMALL"
+    echo ""
+
+    # Save to last-model file (large on line 1, small on line 2)
+    printf '%s\n%s\n' "$SELECTED_LARGE" "$SELECTED_SMALL" > "$LAST_MODEL_FILE"
+}
+
+check_claude_cli() {
+    if ! command -v claude &> /dev/null; then
+        log_error "Claude Code CLI not found"
+        echo ""
+        echo "Install Claude Code from: https://claude.ai/code"
+        exit 1
+    fi
+}
+
+display_config() {
+    local base_url="$1"
+    local models="$2"
+
+    echo ""
+    echo "Configuration:"
+    echo "  Base URL: $base_url"
+    if [[ -n "$models" ]]; then
+        echo "  Models: $models"
+    fi
+    echo "  Service: $PROXY_SERVICE"
+    echo ""
+}
+
+create_temp_settings() {
+    local base_url="$1"
+    local api_key="$2"
+    local large_model="$3"
+    local small_model="$4"
+
+    cat > "$TEMP_SETTINGS" <<EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$base_url",
+    "ANTHROPIC_AUTH_TOKEN": "$api_key",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$large_model",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$large_model",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$small_model"
+  }
+}
+EOF
+}
+
+# Handle special flags
+case "$1" in
+    --health-check)
+        check_proxy_service
+        check_health_endpoint "$DEFAULT_BASE_URL"
+        exit 0
+        ;;
+    --show-config)
+        check_proxy_service
+        config_file=$(find_config_file)
+        base_url=$(extract_base_url "$config_file")
+        check_health_endpoint "$base_url"
+        models=$(extract_models "$base_url")
+        display_config "$base_url" "$models"
+        exit 0
+        ;;
+    --help|-h)
+        echo "Usage: claude-proxy [claude_options]"
+        echo ""
+        echo "Wrapper script to launch Claude Code with anthropic-transparent-proxy."
+        echo ""
+        echo "Options:"
+        echo "  --health-check    Check proxy service health and exit"
+        echo "  --show-config     Display proxy configuration and exit"
+        echo "  --help, -h        Show this help message"
+        echo ""
+        echo "Any other options are passed directly to the claude command."
+        echo ""
+        echo "Examples:"
+        echo "  claude-proxy chat \"help me write code\""
+        echo "  claude-proxy --help"
+        echo "  claude-proxy --health-check"
+        exit 0
+        ;;
+esac
+
+# Main execution
+main() {
+    # Check prerequisites
+    check_claude_cli
+    check_proxy_service
+
+    # Find and read configuration
+    config_file=$(find_config_file)
+    base_url=$(extract_base_url "$config_file")
+    api_key=$(extract_api_key "$config_file")
+
+    # Health checks
+    check_health_endpoint "$base_url"
+
+    # Interactive model selection (large + small)
+    select_models "$base_url"
+
+    # Create temporary settings file with proxy configuration
+    create_temp_settings "$base_url" "$api_key" "$SELECTED_LARGE" "$SELECTED_SMALL"
+
+    # Launch Claude Code with temporary settings (only affects this session)
+    exec claude --settings "$TEMP_SETTINGS" "$@"
+}
+
+main "$@"

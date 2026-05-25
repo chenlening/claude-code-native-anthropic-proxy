@@ -1,4 +1,15 @@
+# Build output
 bin/
-.DS_Store
-cover.out
 /proxy
+
+# Secrets
+configs/backends/
+
+# Internal docs
+docs/plans/
+
+# Go coverage
+coverage.out
+
+# OS
+.DS_Store

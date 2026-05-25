@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -17,8 +15,8 @@ import (
 	"github.com/anthropic-transparent-proxy/internal/endpoint"
 	"github.com/anthropic-transparent-proxy/internal/healthcheck"
 	"github.com/anthropic-transparent-proxy/internal/metrics"
+	"github.com/anthropic-transparent-proxy/internal/models"
 	"github.com/anthropic-transparent-proxy/internal/proxy"
-	"github.com/anthropic-transparent-proxy/internal/routing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -42,14 +40,14 @@ func main() {
 	// Setup logger
 	var logLevel slog.Level
 	switch cfg.Logging.Level {
-	case "debug":
-		logLevel = slog.LevelDebug
+	case "info":
+		logLevel = slog.LevelInfo
 	case "warn":
 		logLevel = slog.LevelWarn
 	case "error":
 		logLevel = slog.LevelError
 	default:
-		logLevel = slog.LevelInfo
+		logLevel = slog.LevelDebug
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
@@ -68,19 +66,17 @@ func main() {
 
 	// Register endpoints and find their probe models
 	for name, epCfg := range cfg.Endpoints {
-		ep := endpoint.NewEndpointState(name, epCfg.URL, epCfg.APIKey)
+		if epCfg.Offline {
+			logger.Info("skipping offline endpoint", "endpoint", name)
+			continue
+		}
+
+		ep := endpoint.NewEndpointState(name, epCfg.URL, epCfg.APIKey, epCfg.ModelsEndpoint)
 		if epCfg.Timeout > 0 {
 			ep.WithTimeout(epCfg.Timeout)
 		}
 
-		// Find the first backend model that uses this endpoint
-		for _, modelCfg := range cfg.Models {
-			for _, backend := range modelCfg.Backends {
-				if backend.Endpoint == ep.Name && ep.ProbeModel == "" {
-					ep.ProbeModel = backend.Model
-				}
-			}
-		}
+		// Use first endpoint model for probe if not set (will be overridden by model discovery)
 		if ep.ProbeModel == "" {
 			ep.ProbeModel = "test" // fallback
 		}
@@ -88,6 +84,10 @@ func main() {
 		hm.AddEndpoint(ep)
 		m.SetEndpointEnabled(name, true)
 	}
+
+	// Discover supported models via /v1/models (synchronous initial discovery)
+	logger.Info("discovering endpoint model support via /v1/models")
+	hm.DiscoverModelsOnce()
 
 	// Verify all endpoints are reachable (lenient mode - log warning, don't fail)
 	// If ALL endpoints fail, log error and exit since proxy can't work
@@ -115,19 +115,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize router
-	lb := routing.NewLeastConnectionsLoadBalancer()
-	router := routing.NewModelRouter(cfg, hm, lb)
-
 	// Start recovery probe
 	stopCh := make(chan struct{})
 	go hm.RunRecoveryProbe(stopCh)
 
+	// Start periodic model discovery refresh
+	go hm.StartModelDiscovery(5*time.Minute, stopCh)
+
 	// Setup HTTP mux
 	mux := http.NewServeMux()
 
+	// Models endpoint (must be registered before /v1/ handler)
+	modelsHandler := models.NewHandler(hm, logger)
+	mux.Handle("/v1/models", modelsHandler)
+
 	// Proxy handler
-	proxyHandler := proxy.NewHandler(router, hm, m, logger)
+	proxyHandler := proxy.NewHandler(hm, m, logger)
 	mux.Handle("/v1/", proxyHandler)
 
 	// Health endpoint
@@ -168,7 +171,6 @@ func main() {
 	logger.Info("starting proxy server",
 		"listen", cfg.Server.Listen,
 		"endpoints", len(cfg.Endpoints),
-		"models", len(cfg.Models),
 	)
 
 	fmt.Fprintf(os.Stderr, "anthropic-transparent-proxy listening on %s\n", cfg.Server.Listen)
@@ -196,33 +198,6 @@ func main() {
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
-	}
-
-	// Send E2E test request to verify proxy works end-to-end
-	testRequest := map[string]interface{}{
-		"model": "claude-haiku-3-5-20241022",
-		"max_tokens": 5,
-		"messages": []map[string]string{
-			{"role": "user", "content": "hi"},
-		},
-	}
-	testBody, _ := json.Marshal(testRequest)
-	req, err := http.NewRequest("POST", "http://"+cfg.Server.Listen+"/v1/messages", bytes.NewReader(testBody))
-	if err == nil {
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Api-Key", "test")
-		req.Header.Set("Anthropic-Version", "2023-06-01")
-		resp, err := client.Do(req)
-		if err != nil {
-			logger.Error("E2E test failed: proxy request error", "error", err)
-			os.Exit(1)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			logger.Error("E2E test failed: proxy returned non-200 status", "status", resp.StatusCode)
-			os.Exit(1)
-		}
-		logger.Info("E2E test passed: proxy verified working")
 	}
 
 	// Wait for shutdown signal or server error

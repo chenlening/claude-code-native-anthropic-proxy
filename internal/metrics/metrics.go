@@ -25,15 +25,17 @@ type BackendStats struct {
 
 // EndpointSnapshot holds per-endpoint summary for health response
 type EndpointSnapshot struct {
-	Status            string     `json:"status"`
-	Requests          int64      `json:"requests"`
-	Failures          int64      `json:"failures"`
-	ActiveConnections int        `json:"active_connections"`
-	LastRequestTime   *time.Time `json:"lastRequestTime,omitempty"`
-	LastFailureTime   *time.Time `json:"lastFailureTime,omitempty"`
-	LastFailureReason string     `json:"lastFailureReason,omitempty"`
-	LastProbeTime     *time.Time `json:"lastProbeTime,omitempty"`
-	LastProbeSuccess  *bool      `json:"lastProbeSuccess,omitempty"`
+	Status             string     `json:"status"`
+	Requests           int64      `json:"requests"`
+	Failures           int64      `json:"failures"`
+	ActiveConnections  int        `json:"active_connections"`
+	LastRequestTime    *time.Time `json:"lastRequestTime,omitempty"`
+	LastFailureTime    *time.Time `json:"lastFailureTime,omitempty"`
+	LastFailureReason  string     `json:"lastFailureReason,omitempty"`
+	LastDiscoveryError string     `json:"lastDiscoveryError,omitempty"`
+	LastProbeTime      *time.Time `json:"lastProbeTime,omitempty"`
+	LastProbeSuccess   *bool      `json:"lastProbeSuccess,omitempty"`
+	SupportedModels    []string   `json:"supported_models,omitempty"`
 }
 
 // ModelSnapshot holds per-backend-model summary for health response

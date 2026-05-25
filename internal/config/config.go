@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"time"
@@ -16,7 +17,6 @@ type Config struct {
 	Metrics        MetricsConfig             `yaml:"metrics"`
 	Health         HealthConfig              `yaml:"health"`
 	Routing        RoutingConfig             `yaml:"routing"`
-	Models         map[string]ModelConfig    `yaml:"models"`
 	Endpoints      map[string]EndpointConfig `yaml:"endpoints"`
 	EndpointHealth EndpointHealthConfig      `yaml:"endpoint_health"`
 }
@@ -51,24 +51,13 @@ type RoutingConfig struct {
 	DefaultStrategy string `yaml:"default_strategy"`
 }
 
-// ModelConfig holds model mapping configuration
-type ModelConfig struct {
-	Strategy string         `yaml:"strategy"` // Optional override
-	Backends []BackendConfig `yaml:"backends"`
-}
-
-// BackendConfig holds backend endpoint configuration for a model
-type BackendConfig struct {
-	Endpoint string `yaml:"endpoint"` // References endpoint name
-	Model    string `yaml:"model"`    // Backend model name
-	Weight   int    `yaml:"weight"`   // For weighted strategies
-}
-
 // EndpointConfig holds endpoint configuration
 type EndpointConfig struct {
-	URL     string        `yaml:"url"`
-	APIKey  string        `yaml:"api_key"` // Supports ${ENV_VAR}
-	Timeout time.Duration `yaml:"timeout"`
+	URL            string        `yaml:"url"`
+	ModelsEndpoint string        `yaml:"models_endpoint"` // Optional: custom URL for model discovery
+	APIKey         string        `yaml:"api_key"` // Supports ${ENV_VAR}
+	Timeout        time.Duration `yaml:"timeout"`
+	Offline        bool          `yaml:"offline"` // Permanently disable endpoint
 }
 
 // EndpointHealthConfig holds health management settings
@@ -126,15 +115,11 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("at least one endpoint is required")
 	}
 
-	if len(c.Models) == 0 {
-		return fmt.Errorf("at least one model mapping is required")
-	}
-
-	// Validate that all model backends reference valid endpoints
-	for modelName, modelCfg := range c.Models {
-		for _, backend := range modelCfg.Backends {
-			if _, exists := c.Endpoints[backend.Endpoint]; !exists {
-				return fmt.Errorf("model %q references unknown endpoint %q", modelName, backend.Endpoint)
+	// Validate models_endpoint URLs if provided
+	for name, ep := range c.Endpoints {
+		if ep.ModelsEndpoint != "" {
+			if _, err := url.Parse(ep.ModelsEndpoint); err != nil {
+				return fmt.Errorf("endpoint %s models_endpoint must be a valid URL: %w", name, err)
 			}
 		}
 	}

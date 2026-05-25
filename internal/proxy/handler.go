@@ -9,12 +9,10 @@ import (
 
 	"github.com/anthropic-transparent-proxy/internal/endpoint"
 	"github.com/anthropic-transparent-proxy/internal/metrics"
-	"github.com/anthropic-transparent-proxy/internal/routing"
 )
 
 // Handler is the main proxy HTTP handler
 type Handler struct {
-	router    *routing.ModelRouter
 	healthMgr *endpoint.HealthManager
 	metrics   *metrics.Metrics
 	logger    *slog.Logger
@@ -22,13 +20,11 @@ type Handler struct {
 
 // NewHandler creates a new proxy handler
 func NewHandler(
-	router *routing.ModelRouter,
 	healthMgr *endpoint.HealthManager,
 	metrics *metrics.Metrics,
 	logger *slog.Logger,
 ) *Handler {
 	return &Handler{
-		router:    router,
 		healthMgr: healthMgr,
 		metrics:   metrics,
 		logger:    logger,
@@ -49,56 +45,62 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body.Close()
 
 	// Extract model from request
-	frontendModel, _, err := ExtractModel(bodyBytes)
+	frontendModel, parsedReq, err := ParseRequest(bodyBytes)
 	if err != nil {
-		h.logger.Error("failed to extract model", "error", err)
+		h.logger.Error("failed to parse request", "error", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Resolve pool to determine max attempts
-	pool, err := h.router.Resolve(frontendModel)
-	if err != nil {
-		h.logger.Error("no backend available", "model", frontendModel, "error", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	// Get endpoints that support this model
+	supportedEndpointNames := h.healthMgr.GetEndpointsForModel(frontendModel)
+	if len(supportedEndpointNames) == 0 {
+		h.logger.Error("model not supported by any endpoint", "model", frontendModel)
+		http.Error(w, "model not supported by any endpoint", http.StatusServiceUnavailable)
 		return
 	}
-	maxAttempts := len(pool.Backends)
+
+	// Build endpoint map for quick lookup
+	supportedEndpoints := make(map[string]*endpoint.EndpointState)
+	for _, name := range supportedEndpointNames {
+		ep := h.healthMgr.GetEndpoint(name)
+		if ep != nil && !ep.IsDisabled() {
+			supportedEndpoints[name] = ep
+		}
+	}
+
+	if len(supportedEndpoints) == 0 {
+		h.logger.Error("all endpoints supporting model are disabled", "model", frontendModel)
+		http.Error(w, "model not supported by any endpoint", http.StatusServiceUnavailable)
+		return
+	}
+
+	maxAttempts := len(supportedEndpoints)
 
 	// Retry loop for 429 responses
 	attempted := make(map[string]bool)
 
 	var resp *http.Response
-	var selectedBackend *routing.ModelBackend
 	var selectedEp *endpoint.EndpointState
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		backend, err := h.router.SelectBackendWithExclusion(frontendModel, attempted)
-		if err != nil {
-			break // no more backends available
+		// Select least-connections endpoint from supported endpoints
+		ep := h.selectLeastConnectionsEndpoint(frontendModel, supportedEndpoints, attempted)
+		if ep == nil {
+			break // no more endpoints available
 		}
-		ep := backend.Endpoint
 		attempted[ep.Name] = true
 
 		h.logger.Info("routing request",
 			"frontend_model", frontendModel,
-			"backend_model", backend.BackendModel,
 			"endpoint", ep.Name,
 			"attempt", attempt+1,
 		)
 
-		// Replace model in request body
-		modifiedBody, err := ReplaceModel(bodyBytes, backend.BackendModel)
-		if err != nil {
-			h.logger.Error("failed to replace model", "error", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-
 		// Track connection
 		ep.IncrementConnection(frontendModel)
 
-		// Create upstream request
+		// Create upstream request - forward body unchanged (no model rewriting)
 		upstreamReq, err := http.NewRequest(r.Method, ep.URL+r.URL.Path, nil)
 		if err != nil {
 			ep.DecrementConnection(frontendModel)
@@ -107,16 +109,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Set body from modified content
-		upstreamReq.Body = io.NopCloser(io.Reader(nil))
-		upstreamReq.ContentLength = int64(len(modifiedBody))
-		upstreamReq.Body = &closingReader{src: modifiedBody}
+		// Propagate client context so upstream is cancelled if client disconnects
+		upstreamReq = upstreamReq.WithContext(r.Context())
+
+		// Set body from original content (no model replacement)
+		upstreamReq.ContentLength = int64(len(bodyBytes))
+		upstreamReq.Body = &closingReader{src: bodyBytes}
 
 		// Copy headers, replacing auth
 		for key, values := range r.Header {
 			for _, value := range values {
 				lowerKey := key
-				// Skip original auth headers
 				if lowerKey == "X-Api-Key" || lowerKey == "Authorization" {
 					continue
 				}
@@ -132,27 +135,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ep.DecrementConnection(frontendModel)
 			h.logger.Error("upstream request failed", "endpoint", ep.Name, "error", err)
 			h.healthMgr.RecordFailure(ep, "network_error")
-			h.metrics.RecordRequest(frontendModel, backend.BackendModel, ep.Name, time.Since(start).Seconds(), false)
+			h.metrics.RecordRequest(frontendModel, frontendModel, ep.Name, time.Since(start).Seconds(), false)
 			continue
 		}
 
 		// If not 429, this is our final response
 		if resp.StatusCode != 429 {
-			selectedBackend = backend
 			selectedEp = ep
 			break
 		}
 
-		// 429 — read body for failure reason, close, decrement, record, try next backend
+		// 429 — read body for failure reason, close, decrement, record, try next endpoint
 		reason := fmt.Sprintf("status=429 body=%q", readBodyForReason(resp.Body))
 		h.healthMgr.RecordFailure(ep, reason)
 		ep.DecrementConnection(frontendModel)
-		h.logger.Warn("rate limited, retrying on next backend",
+		h.logger.Warn("rate limited, retrying on next endpoint",
 			"endpoint", ep.Name, "attempt", attempt+1)
 	}
 
 	if resp == nil {
-		h.logger.Error("all backends exhausted", "model", frontendModel)
+		h.logger.Error("all endpoints exhausted", "model", frontendModel)
 		http.Error(w, "no backend available", http.StatusServiceUnavailable)
 		return
 	}
@@ -166,17 +168,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if success {
 		h.healthMgr.RecordSuccess(selectedEp)
 	} else {
-		// Buffer error body for both failure reason and client response
 		errBody, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
 		reason := fmt.Sprintf("status=%d body=%q", resp.StatusCode, truncateString(string(errBody), 200))
 		h.healthMgr.RecordFailure(selectedEp, reason)
+
+		// DEBUG: Log request body for 4xx errors to help diagnose tool_result issues
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			h.logger.Warn("backend returned client error",
+				"endpoint", selectedEp.Name,
+				"status", resp.StatusCode,
+				"error_body", truncateString(string(errBody), 500),
+				"request_has_tools", len(parsedReq.Tools) > 0,
+				"request_messages_len", len(parsedReq.Messages),
+			)
+		}
 	}
 
-	h.metrics.RecordRequest(frontendModel, selectedBackend.BackendModel, selectedEp.Name, time.Since(start).Seconds(), success)
+	h.metrics.RecordRequest(frontendModel, frontendModel, selectedEp.Name, time.Since(start).Seconds(), success)
 
-	// Copy response headers
+	// Copy response headers, but remove Content-Length since we may modify the body
 	for key, values := range resp.Header {
+		if key == "Content-Length" {
+			continue // Skip Content-Length - we'll recalculate or use chunked encoding
+		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
@@ -185,33 +200,68 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Write status code
 	w.WriteHeader(resp.StatusCode)
 
-	// Stream response body
-	if errBody != nil {
-		// Error response — write buffered body
-		w.Write(errBody)
-	} else {
-		// Success response — stream from upstream
+	// Stream response body directly (no model replacement)
+	if parsedReq.Stream {
 		flusher, canFlush := w.(http.Flusher)
 		buf := make([]byte, 32*1024)
+
 		for {
-			n, err := resp.Body.Read(buf)
+			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
-				w.Write(buf[:n])
+				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+					break
+				}
 				if canFlush {
 					flusher.Flush()
 				}
 			}
-			if err != nil {
+			if readErr != nil {
 				break
 			}
 		}
+	} else {
+		// Non-streaming response - read entire body and send
+		var body []byte
+		if errBody != nil {
+			// Error response already read
+			body = errBody
+		} else {
+			// Success response - read body
+			body, err = io.ReadAll(resp.Body)
+			if err != nil {
+				h.logger.Error("failed to read response body", "error", err)
+				http.Error(w, "failed to read response", http.StatusInternalServerError)
+				return
+			}
+		}
+
+		w.Write(body)
 	}
+}
+
+// selectLeastConnectionsEndpoint selects the endpoint with the lowest connection count
+func (h *Handler) selectLeastConnectionsEndpoint(model string, endpoints map[string]*endpoint.EndpointState, exclude map[string]bool) *endpoint.EndpointState {
+	var selected *endpoint.EndpointState
+	minLoad := float64(-1)
+
+	for _, ep := range endpoints {
+		if exclude[ep.Name] {
+			continue
+		}
+		count := ep.GetConnectionCount(model)
+		if selected == nil || float64(count) < minLoad {
+			selected = ep
+			minLoad = float64(count)
+		}
+	}
+
+	return selected
 }
 
 // closingReader wraps a byte slice as an io.ReadCloser
 type closingReader struct {
-	src  []byte
-	pos  int
+	src []byte
+	pos int
 }
 
 func (r *closingReader) Read(p []byte) (int, error) {

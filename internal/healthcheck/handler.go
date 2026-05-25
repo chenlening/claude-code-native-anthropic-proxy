@@ -15,8 +15,8 @@ import (
 
 // HealthResponse is the JSON response for /health endpoint
 type HealthResponse struct {
-	Status        string                        `json:"status"`
-	TotalRequests int64                         `json:"total_requests"`
+	Status        string                              `json:"status"`
+	TotalRequests int64                               `json:"total_requests"`
 	Endpoints     map[string]metrics.EndpointSnapshot `json:"endpoints"`
 	Models        map[string]metrics.ModelSnapshot    `json:"models"`
 	ByBackend     []metrics.BackendStats              `json:"by_backend"`
@@ -68,20 +68,6 @@ func (h *Handler) buildHealthData() HealthResponse {
 		Models:    make(map[string]metrics.ModelSnapshot),
 	}
 
-	// Initialize all configured backend models with zero stats
-	if h.cfg != nil {
-		for _, modelCfg := range h.cfg.Models {
-			for _, backend := range modelCfg.Backends {
-				if _, exists := resp.Models[backend.Model]; !exists {
-					resp.Models[backend.Model] = metrics.ModelSnapshot{
-						Requests: 0,
-						Latency:  metrics.LatencyStats{},
-					}
-				}
-			}
-		}
-	}
-
 	snap := h.metrics.Snapshot()
 	resp.TotalRequests = snap.TotalRequests
 	resp.ByBackend = snap.ByBackend
@@ -100,6 +86,12 @@ func (h *Handler) buildHealthData() HealthResponse {
 		if t := ep.GetLastRequestTime(); !t.IsZero() {
 			eps.LastRequestTime = &t
 		}
+		if t := ep.GetLastFailureTime(); !t.IsZero() {
+			eps.LastFailureTime = &t
+		}
+		eps.LastFailureReason = ep.GetLastFailureReason()
+		eps.LastDiscoveryError = ep.GetDiscoveryError()
+		eps.SupportedModels = ep.GetSupportedModels()
 		resp.Endpoints[ep.Name] = eps
 	}
 	for _, ep := range disabled {
@@ -113,12 +105,25 @@ func (h *Handler) buildHealthData() HealthResponse {
 			eps.LastFailureTime = &t
 		}
 		eps.LastFailureReason = ep.GetLastFailureReason()
+		eps.LastDiscoveryError = ep.GetDiscoveryError()
 		if t := ep.GetLastProbeTime(); !t.IsZero() {
 			eps.LastProbeTime = &t
 			probeSuccess := ep.GetLastProbeSuccess()
 			eps.LastProbeSuccess = &probeSuccess
 		}
+		eps.SupportedModels = ep.GetSupportedModels()
 		resp.Endpoints[ep.Name] = eps
+	}
+
+	// Add offline endpoints from config (intentionally excluded from routing)
+	if h.cfg != nil {
+		for name, epCfg := range h.cfg.Endpoints {
+			if epCfg.Offline {
+				resp.Endpoints[name] = metrics.EndpointSnapshot{
+					Status: "offline",
+				}
+			}
+		}
 	}
 
 	totalEndpoints := len(endpoints) + len(disabled)
@@ -157,6 +162,7 @@ func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "\n", " ")
 	return s
 }
 
@@ -205,9 +211,13 @@ td code{background:#334155;padding:2px 6px;border-radius:4px;font-size:12px}
 .green{background:#22c55e}
 .amber{background:#f59e0b}
 .red{background:#ef4444}
+.gray{background:#64748b}
 .footer{text-align:center;padding-top:8px}
 .footer a{color:#60a5fa;text-decoration:none;font-size:12px}
 .footer span{color:#475569;font-size:12px}
+.models{display:flex;flex-wrap:wrap;gap:4px}
+.model-tag{background:#334155;padding:2px 6px;border-radius:4px;font-size:11px}
+.model-header{background:#334155;padding:8px;margin-bottom:8px;border-radius:4px;font-size:13px;color:#e2e8f0}
 </style>
 </head>
 <body>
@@ -233,7 +243,7 @@ td code{background:#334155;padding:2px 6px;border-radius:4px;font-size:12px}
 
 	// Endpoints table
 	sb.WriteString(`<div class="card"><h2>Endpoints</h2><div class="table-wrap"><table>
-<tr><th>Endpoint</th><th>Status</th><th>Requests</th><th>Failures</th><th>Last Req</th><th>Last Fail</th><th>Fail Reason</th><th>Last Probe</th></tr>
+<tr><th>Endpoint</th><th>Status</th><th>Requests</th><th>Failures</th><th>Models</th><th>Last Req</th><th>Last Fail</th><th>Fail Reason</th></tr>
 `)
 	// Sort endpoint names for consistent display
 	epNames := make([]string, 0, len(data.Endpoints))
@@ -246,40 +256,94 @@ td code{background:#334155;padding:2px 6px;border-radius:4px;font-size:12px}
 		cls := "green"
 		if ep.Status == "disabled" {
 			cls = "red"
+		} else if ep.Status == "offline" {
+			cls = "gray"
 		}
-		sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td><span class="badge %s">%s</span></td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td title="%s">%s</td><td>%s</td></tr>
-`, name, cls, ep.Status, ep.Requests, ep.Failures, formatTime(ep.LastRequestTime), formatTime(ep.LastFailureTime), htmlEscape(ep.LastFailureReason), truncateFailureReason(ep.LastFailureReason, 100), formatTime(ep.LastProbeTime)))
+		var modelsHTML string
+		if len(ep.SupportedModels) > 0 {
+			var mb strings.Builder
+			mb.WriteString(`<div class="models">`)
+			for _, m := range ep.SupportedModels {
+				mb.WriteString(fmt.Sprintf(`<span class="model-tag">%s</span>`, htmlEscape(m)))
+			}
+			mb.WriteString(`</div>`)
+			modelsHTML = mb.String()
+		} else {
+			modelsHTML = "—"
+		}
+		failReason := ep.LastFailureReason
+		if failReason == "" {
+			failReason = ep.LastDiscoveryError
+		}
+		sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td><span class="badge %s">%s</span></td><td>%d</td><td>%d</td><td>%s</td><td>%s</td><td>%s</td><td title="%s">%s</td></tr>
+`, name, cls, ep.Status, ep.Requests, ep.Failures, modelsHTML, formatTime(ep.LastRequestTime), formatTime(ep.LastFailureTime), htmlEscape(failReason), truncateFailureReason(failReason, 100)))
 	}
 	sb.WriteString("</table></div></div>\n")
 
-	// Models table
-	if len(data.Models) > 0 {
-		sb.WriteString(`<div class="card"><h2>Backend Models</h2><div class="table-wrap"><table>
-<tr><th>Model</th><th>Requests</th><th>Min (ms)</th><th>Max (ms)</th><th>Avg (ms)</th></tr>
-`)
-		modelNames := make([]string, 0, len(data.Models))
-		for name := range data.Models {
+	// Access Latency card
+	if len(data.ByBackend) > 0 {
+		sb.WriteString(`<div class="card"><h2>Access Latency</h2>`)
+
+		// Group by FrontendModel
+		modelGroups := make(map[string][]metrics.BackendStats)
+		for _, b := range data.ByBackend {
+			modelGroups[b.FrontendModel] = append(modelGroups[b.FrontendModel], b)
+		}
+
+		modelNames := make([]string, 0, len(modelGroups))
+		for name := range modelGroups {
 			modelNames = append(modelNames, name)
 		}
 		sort.Strings(modelNames)
-		for _, name := range modelNames {
-			m := data.Models[name]
-			sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td>%d</td><td>%.1f</td><td>%.1f</td><td>%.1f</td></tr>
-`, name, m.Requests, m.Latency.MinMs, m.Latency.MaxMs, m.Latency.AvgMs))
-		}
-		sb.WriteString("</table></div></div>\n")
-	}
 
-	// Backend routing table
-	if len(data.ByBackend) > 0 {
-		sb.WriteString(`<div class="card"><h2>Backend Routing</h2><div class="table-wrap"><table>
-<tr><th>Frontend</th><th>Backend</th><th>Endpoint</th><th>Reqs</th><th>Min</th><th>Max</th><th>Avg</th></tr>
-`)
-		for _, b := range data.ByBackend {
-			sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td>%d</td><td>%.1f</td><td>%.1f</td><td>%.1f</td></tr>
-`, b.FrontendModel, b.BackendModel, b.Endpoint, b.Latency.Count, b.Latency.MinMs, b.Latency.MaxMs, b.Latency.AvgMs))
+		for _, modelName := range modelNames {
+			entries := modelGroups[modelName]
+			sb.WriteString(fmt.Sprintf(`<div class="model-header"><code>%s</code></div>`, htmlEscape(modelName)))
+			sb.WriteString(fmt.Sprintf(`<div class="table-wrap" style="margin-bottom:12px"><table>
+<tr><th>Backend</th><th>Requests</th><th>Min (ms)</th><th>Max (ms)</th><th>Avg (ms)</th></tr>
+`))
+
+			var totalReqs int64
+			var totalTimeMs float64
+			var minMs, maxMs, avgMs float64
+
+			sort.Slice(entries, func(i, j int) bool {
+				return entries[i].Endpoint < entries[j].Endpoint
+			})
+
+			for _, b := range entries {
+				totalReqs += b.Latency.Count
+				totalTimeMs += b.Latency.AvgMs * float64(b.Latency.Count)
+				sb.WriteString(fmt.Sprintf(`<tr><td><code>%s</code></td><td>%d</td><td>%.1f</td><td>%.1f</td><td>%.1f</td></tr>
+`, b.Endpoint, b.Latency.Count, b.Latency.MinMs, b.Latency.MaxMs, b.Latency.AvgMs))
+			}
+
+			// Summary line
+			if totalReqs > 0 {
+				avgMs = totalTimeMs / float64(totalReqs)
+				minMs = entries[0].Latency.MinMs
+				maxMs = entries[0].Latency.MaxMs
+				for _, b := range entries {
+					if b.Latency.MinMs < minMs {
+						minMs = b.Latency.MinMs
+					}
+					if b.Latency.MaxMs > maxMs {
+						maxMs = b.Latency.MaxMs
+					}
+				}
+			}
+
+			sb.WriteString(fmt.Sprintf(`</table>
+<div style="display:flex;gap:16px;padding:6px 8px;border-top:1px solid #334155;font-size:12px">
+<span><strong>Total:</strong> %d reqs</span>
+<span><strong>Min:</strong> %.1f ms</span>
+<span><strong>Max:</strong> %.1f ms</span>
+<span><strong>Avg:</strong> %.1f ms</span>
+</div>
+`, totalReqs, minMs, maxMs, avgMs))
+			sb.WriteString("</div>\n")
 		}
-		sb.WriteString("</table></div></div>\n")
+		sb.WriteString("</div>\n")
 	}
 
 	sb.WriteString(`<div class="footer"><a href="/metrics">Prometheus Metrics</a> <span>|</span> <a href="https://github.com/2012geek/anthropic-transparent-proxy">GitHub</a></div>

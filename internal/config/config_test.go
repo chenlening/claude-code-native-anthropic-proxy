@@ -28,13 +28,6 @@ health:
 routing:
   default_strategy: least-connections
 
-models:
-  claude-sonnet-4-20250514:
-    backends:
-      - endpoint: endpoint-a
-        model: "claude-sonnet-4-20250514"
-        weight: 10
-
 endpoints:
   endpoint-a:
     url: "https://api.anthropic.com"
@@ -73,14 +66,6 @@ endpoint_health:
 	}
 	if cfg.Endpoints["endpoint-a"].URL != "https://api.anthropic.com" {
 		t.Errorf("endpoint-a URL = %q", cfg.Endpoints["endpoint-a"].URL)
-	}
-
-	// Verify models
-	if len(cfg.Models) != 1 {
-		t.Errorf("len(Models) = %d, want 1", len(cfg.Models))
-	}
-	if len(cfg.Models["claude-sonnet-4-20250514"].Backends) != 1 {
-		t.Errorf("Backends count = %d, want 1", len(cfg.Models["claude-sonnet-4-20250514"].Backends))
 	}
 
 	// Verify health config
@@ -177,9 +162,6 @@ func TestConfigValidate(t *testing.T) {
 				Endpoints: map[string]EndpointConfig{
 					"endpoint-a": {URL: "https://api.anthropic.com"},
 				},
-				Models: map[string]ModelConfig{
-					"claude-sonnet": {Backends: []BackendConfig{{Endpoint: "endpoint-a"}}},
-				},
 			},
 			wantErr: false,
 		},
@@ -190,9 +172,6 @@ func TestConfigValidate(t *testing.T) {
 				Endpoints: map[string]EndpointConfig{
 					"endpoint-a": {URL: "https://api.anthropic.com"},
 				},
-				Models: map[string]ModelConfig{
-					"claude-sonnet": {Backends: []BackendConfig{{Endpoint: "endpoint-a"}}},
-				},
 			},
 			wantErr: true,
 		},
@@ -201,22 +180,6 @@ func TestConfigValidate(t *testing.T) {
 			config: Config{
 				Server:    ServerConfig{Listen: ":8080"},
 				Endpoints: map[string]EndpointConfig{},
-				Models: map[string]ModelConfig{
-					"claude-sonnet": {Backends: []BackendConfig{{Endpoint: "endpoint-a"}}},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "invalid endpoint reference",
-			config: Config{
-				Server: ServerConfig{Listen: ":8080"},
-				Endpoints: map[string]EndpointConfig{
-					"endpoint-a": {URL: "https://api.anthropic.com"},
-				},
-				Models: map[string]ModelConfig{
-					"claude-sonnet": {Backends: []BackendConfig{{Endpoint: "nonexistent"}}},
-				},
 			},
 			wantErr: true,
 		},

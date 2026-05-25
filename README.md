@@ -1,35 +1,21 @@
 # Anthropic Transparent Proxy
 
-A transparent Anthropic API proxy for Claude Code with multi-endpoint load balancing and automatic failover.
+A transparent Anthropic API proxy for Claude Code with multi-endpoint load balancing, automatic failover, and dynamic model discovery.
 
 ## Features
 
-- **Transparent streaming** - Native Anthropic SSE format preserved, no format conversion
-- **Model-level least-connections load balancing** - Tracks connections per model per endpoint
-- **Automatic failover** - Retries on next endpoint when one fails
-- **Model name mapping** - Frontend model names mapped to backend model names
-- **Stateless deployment** - No database required, YAML configuration
-- **Prometheus metrics** - Request counts, duration, endpoint status
-- **Health endpoint** - `/health` for Kubernetes readiness probes
-- **Single binary** - Easy deployment, no external dependencies
-
-## Architecture
-
-```
-Claude Code → Proxy → Multiple Anthropic Endpoints
-                    ↓
-              Load Balancer (least-connections)
-                    ↓
-              Model Router (frontend → backend)
-                    ↓
-              Health Manager (auto-disable/enable)
-```
+- **Transparent streaming** — Native Anthropic SSE format preserved, no format conversion
+- **Least-connections load balancing** — Tracks connections per model per endpoint
+- **Automatic failover** — Retries on next endpoint when rate-limited or failing
+- **Dynamic model discovery** — Auto-discovers supported models from each backend via `/v1/models`
+- **Stateless deployment** — No database required, YAML configuration
+- **Prometheus metrics** — Request counts, duration, endpoint status
+- **Health dashboard** — HTML health endpoint with latency stats
+- **Single binary** — Easy deployment, no external dependencies
 
 ## Quick Start
 
 **Linux:**
-
-Clone this repo, open Claude Code in the project directory, and say "install this project". I will read `.claude/commands/install.md` and guide you through the installation steps.
 
 ```bash
 make build
@@ -38,37 +24,17 @@ make build
 
 **macOS:**
 
-See [docs/macos-install.md](docs/macos-install.md) for step-by-step installation instructions using launchd.
-
-## Claude Code Configuration
-
-When you ask me to install, I read `.claude/commands/install.md` and configure this automatically. For manual setup, add to `~/.claude/settings.json`:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_AUTH_TOKEN": "anykey",
-    "ANTHROPIC_BASE_URL": "http://localhost:8080",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-3-5-20241022",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-20250514",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-20250514"
-  }
-}
-```
-
-The model env vars must match the frontend model names in `configs/proxy.yaml`. Claude Code uses these to route requests through the proxy.
+See [docs/macos-install.md](docs/macos-install.md) for launchd-based installation.
 
 ## Configuration
 
-Configuration is via YAML file. See `configs/proxy.yaml` for the default config.
-
-### Example Configuration
+Configuration is via YAML file. See `configs/proxy.yaml.example` for a template.
 
 ```yaml
 server:
   listen: ":8080"
   read_timeout: 30s
-  write_timeout: 120s
+  write_timeout: 0s
   idle_timeout: 90s
 
 logging:
@@ -82,29 +48,10 @@ metrics:
 health:
   path: /health
 
-routing:
-  default_strategy: least-connections
-
-# Model mappings: frontend model → backend pool
-models:
-  claude-sonnet-4-20250514:
-    backends:
-      - endpoint: endpoint-a
-        model: "claude-sonnet-4-20250514"
-        weight: 10
-      - endpoint: endpoint-b
-        model: "custom-sonnet-model"
-        weight: 5
-
 endpoints:
   endpoint-a:
     url: "https://api.anthropic.com"
     api_key: "${ANTHROPIC_API_KEY}"
-    timeout: 90s
-
-  endpoint-b:
-    url: "https://custom-provider.example.com/v1"
-    api_key: "${CUSTOM_PROVIDER_KEY}"
     timeout: 90s
 
 endpoint_health:
@@ -116,45 +63,44 @@ endpoint_health:
 ### Environment Variables
 
 API keys support environment variable expansion:
-- `${VAR_NAME}` → value of environment variable
-- `${VAR_NAME:-default}` → value or default if unset
+- `${VAR_NAME}` — value of environment variable
+- `${VAR_NAME:-default}` — value or default if unset
 
-### Model Mapping
+### Endpoint Configuration
 
-The proxy maps frontend model names (what Claude Code requests) to backend model names (what providers use):
-
-```yaml
-models:
-  claude-sonnet-4-20250514:     # Frontend model (Claude Code requests this)
-    backends:
-      - endpoint: endpoint-b
-        model: "custom-sonnet"  # Backend model (provider uses this name)
-```
+| Field | Description |
+|-------|-------------|
+| `url` | Base URL for the endpoint's Anthropic-compatible API |
+| `models_endpoint` | Optional custom URL for model discovery (defaults to `url + /v1/models`) |
+| `api_key` | API key for the endpoint (supports `${ENV_VAR}` expansion) |
+| `timeout` | Response header timeout for streaming requests |
+| `offline` | If `true`, permanently excludes endpoint from routing |
 
 ## API Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
 | `POST /v1/messages` | Anthropic Messages API (proxied) |
-| `GET /health` | Health check for Kubernetes probes |
-| `GET /metrics` | Prometheus metrics (if enabled) |
+| `GET /v1/models` | Discover available models across all endpoints |
+| `GET /health` | Health check with HTML dashboard |
 
-### Health Check Response
+## Load Balancing
 
-```json
-{
-  "status": "healthy",
-  "endpoints": {
-    "endpoint-a": "enabled",
-    "endpoint-b": "enabled"
-  }
-}
-```
+The proxy uses **least-connections** strategy at the model level:
 
-Status values:
-- `healthy` - All endpoints enabled
-- `degraded` - Some endpoints disabled
-- `unhealthy` - All endpoints disabled (returns HTTP 503)
+- Tracks active connections per model per endpoint
+- Selects the endpoint with the lowest connection count for the requested model
+- Excludes disabled endpoints from selection
+- On 429 (rate limit), retries on the next available endpoint
+
+## Failover Behavior
+
+1. Connection count decremented on failure
+2. Failure recorded against the endpoint
+3. After 5 failures (configurable), endpoint is disabled
+4. Request retried on next healthy endpoint
+5. Disabled endpoints are periodically probed for recovery
+6. After 2 successful probes, endpoint is re-enabled
 
 ## Prometheus Metrics
 
@@ -164,130 +110,31 @@ Status values:
 | `anthropic_proxy_requests_by_model` | Counter | Requests per model |
 | `anthropic_proxy_requests_by_endpoint` | Counter | Requests per endpoint |
 | `anthropic_proxy_request_duration_seconds` | Histogram | Request latency |
-| `anthropic_proxy_endpoint_connections` | Gauge | Active connections per endpoint/model |
 | `anthropic_proxy_endpoint_failures_total` | Counter | Failures per endpoint |
 | `anthropic_proxy_endpoint_enabled` | Gauge | Endpoint enabled status (1/0) |
 
-## Load Balancing
+## Claude Code Configuration
 
-The proxy uses **least-connections** strategy at the **model level**:
+Add to `~/.claude/settings.json`:
 
-- Tracks active connections per model per endpoint
-- Selects endpoint with lowest connection count for the requested model
-- Excludes disabled endpoints from selection
-- Automatically adjusts to request duration variance
-
-## Failover Behavior
-
-When an endpoint fails:
-1. Connection count decremented
-2. Failure recorded
-3. After 5 failures (configurable), endpoint is disabled
-4. Request retried on next healthy endpoint
-5. Disabled endpoints are periodically probed for recovery
-6. After 2 successful probes, endpoint is re-enabled
-
-## Deployment on Public VPS
-
-When deploying on a public cloud VPS, use SSH tunneling for secure access:
-
-### Why SSH Tunnel?
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| SSH tunnel | Kernel crypto, no proxy TLS overhead | Point-to-point only |
-| HTTPS + tokens | Industry standard | Proxy-side TLS complexity |
-| VPN (WireGuard) | Full mesh | Extra daemon to manage |
-
-### Setup
-
-**1. Proxy Configuration**
-
-Ensure proxy binds to localhost only:
-
-```yaml
-server:
-  listen: "127.0.0.1:8080"  # localhost only, not ":8080"
+```json
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "anykey",
+    "ANTHROPIC_BASE_URL": "http://localhost:8080"
+  }
+}
 ```
 
-**2. VPS Firewall**
+`ANTHROPIC_AUTH_TOKEN` can be any non-empty value — the proxy handles actual authentication.
+
+For direct backend access without the proxy, use the backend switcher:
 
 ```bash
-# UFW example
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp    # SSH
-ufw enable
+source scripts/backend.sh <backend-name>
 ```
 
-**3. SSH Key Setup (client)**
-
-```bash
-# Generate key (one time)
-ssh-keygen -t ed25519 -C "client@hostname"
-
-# Copy to VPS
-ssh-copy-id user@vps-host
-```
-
-**4. Create SSH Tunnel**
-
-```bash
-# Terminal 1: Start tunnel
-ssh -L 8080:localhost:8080 user@vps-host -N
-
-# The tunnel stays open until Ctrl+C
-```
-
-**5. Use the Proxy**
-
-```bash
-# Terminal 2: Configure app
-export ANTHROPIC_BASE_URL="http://localhost:8080"
-export ANTHROPIC_API_KEY="any-key"  # Proxy handles actual keys
-
-# Run Claude Code
-claude
-```
-
-### SSH Config for Convenience
-
-Add to `~/.ssh/config`:
-
-```
-Host proxy-tunnel
-    HostName vps-host
-    User user
-    LocalForward 8080 localhost:8080
-    IdentityFile ~/.ssh/id_ed25519
-    ServerAliveInterval 60
-```
-
-Then simply:
-
-```bash
-ssh proxy-tunnel -N
-```
-
-### Security Notes
-
-| Property | Protection |
-|----------|------------|
-| Network access | Only SSH port (22) exposed; proxy port blocked |
-| Authentication | SSH key auth (Ed25519, forward secrecy) |
-| Encryption | ChaCha20/AES-256 (SSH tunnel) |
-
-The proxy never directly faces the internet. All traffic goes through the encrypted SSH tunnel.
-
-## Testing
-
-```bash
-# Run all tests
-make test
-
-# Or directly
-go test -v ./...
-```
+Available backends are configured in `configs/backends/*.env`.
 
 ## Development
 
@@ -297,72 +144,53 @@ go test -v ./...
 anthropic-transparent-proxy/
 ├── cmd/proxy/main.go          # Entry point
 ├── internal/
-│   ├── config/                # YAML config loading
-│   ├── endpoint/              # Endpoint state, health manager
-│   ├── routing/               # Load balancer, model router
-│   ├── proxy/                 # HTTP handler, request parsing
+│   ├── config/                # YAML config loading with env var support
+│   ├── endpoint/              # Endpoint state, health, model discovery, recovery
+│   ├── proxy/                 # HTTP handler, request parsing, SSE streaming
 │   ├── metrics/               # Prometheus metrics
-│   └── healthcheck/           # Health endpoint
+│   ├── healthcheck/           # Health endpoint with HTML dashboard
+│   └── models/                # /v1/models handler
 ├── configs/
-│   ├── proxy.yaml             # Default config
-│   └── proxy.yaml.example     # Example config
-├── Makefile
-├── go.mod
-└── README.md
+│   ├── proxy.yaml             # Active config
+│   ├── proxy.yaml.example     # Example config template
+│   └── backends/              # Direct backend connection env files
+├── tests/                     # Integration tests
+├── scripts/                   # Utility scripts
+├── deploy/                    # systemd service file
+└── docs/                      # Documentation
 ```
 
 ### Building
 
 ```bash
-make build
+make build        # Build binary to bin/proxy
+make test         # Run unit tests
+make run          # Run with configs/proxy.yaml
 ```
 
 Binary output: `bin/proxy`
 
-### Running
+### systemd Service (Linux)
 
-The proxy can run directly or via systemd service:
-
-**Direct run:**
 ```bash
-./bin/proxy --config configs/proxy.yaml
-```
-
-**Systemd service (Linux, recommended for persistent operation):**
-```bash
-# Link the service file
-sudo ln -sf /home/nice/chenlening/workspace/anthropic-transparent-proxy/deploy/proxy-anthropic.service /etc/systemd/system/
-
-# Reload systemd, enable and start
+sudo ln -sf deploy/proxy-anthropic.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable proxy-anthropic
-sudo systemctl start proxy-anthropic
+sudo systemctl enable --now proxy-anthropic
 
-# Check status
-sudo systemctl status proxy-anthropic
-
-# View logs
-sudo journalctl -u proxy-anthropic -f
+# Status and logs
+systemctl status proxy-anthropic
+journalctl -u proxy-anthropic -f
 ```
 
-Service file location: `deploy/proxy-anthropic.service`
+## Testing
 
-**macOS (launchd):**
+```bash
+# Unit tests
+make test
 
-See [docs/macos-install.md](docs/macos-install.md) for installation instructions using launchd instead of systemd.
-
-## Why This Proxy?
-
-Existing solutions like one-api and LiteLLM have limitations for Claude Code:
-
-| Issue | Existing Solutions | This Proxy |
-|-------|-------------------|------------|
-| Format conversion | OpenAI→Anthropic (tool use bugs) | Anthropic native only |
-| Database required | Yes (deployment complexity) | No (stateless) |
-| Claude Code tool use | May have issues | Fully compatible |
-| Extended thinking | Unknown support | Fully supported |
-
-This proxy is specifically designed for Claude Code, preserving Anthropic's native format for perfect compatibility with tool use, extended thinking, and prompt caching.
+# Integration tests (requires running proxy)
+make test-integration
+```
 
 ## License
 

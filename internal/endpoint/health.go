@@ -16,8 +16,9 @@ type HealthConfig struct {
 type HealthManager struct {
 	config HealthConfig
 
-	mu        sync.RWMutex
-	endpoints map[string]*EndpointState
+	mu           sync.RWMutex
+	endpoints    map[string]*EndpointState
+	modelSupport map[string][]string
 }
 
 // NewHealthManager creates a new health manager
@@ -105,4 +106,23 @@ func (h *HealthManager) GetAllEndpoints() []*EndpointState {
 		endpoints = append(endpoints, ep)
 	}
 	return endpoints
+}
+
+// rebuildModelSupport rebuilds the modelSupport map from current endpoints
+func (h *HealthManager) rebuildModelSupport() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.modelSupport = make(map[string][]string)
+	for _, ep := range h.endpoints {
+		for _, model := range ep.GetSupportedModels() {
+			h.modelSupport[model] = append(h.modelSupport[model], ep.Name)
+		}
+	}
+}
+
+// GetEndpointsForModel returns the list of endpoint names that support a given model
+func (h *HealthManager) GetEndpointsForModel(model string) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.modelSupport[model]
 }

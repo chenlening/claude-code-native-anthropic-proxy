@@ -14,8 +14,8 @@ func TestHealthHandlerReturnsHealthy(t *testing.T) {
 	hm := endpoint.NewHealthManager(endpoint.HealthConfig{FailuresToDisable: 5})
 	m := metrics.NewMetrics("test_health")
 
-	epA := endpoint.NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
-	epB := endpoint.NewEndpointState("endpoint-b", "https://custom.com", "key")
+	epA := endpoint.NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
+	epB := endpoint.NewEndpointState("endpoint-b", "https://custom.com", "key", "")
 	hm.AddEndpoint(epA)
 	hm.AddEndpoint(epB)
 
@@ -52,8 +52,8 @@ func TestHealthHandlerReturnsDegradedWhenSomeDisabled(t *testing.T) {
 	hm := endpoint.NewHealthManager(endpoint.HealthConfig{FailuresToDisable: 1})
 	m := metrics.NewMetrics("test_health")
 
-	epA := endpoint.NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
-	epB := endpoint.NewEndpointState("endpoint-b", "https://custom.com", "key")
+	epA := endpoint.NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
+	epB := endpoint.NewEndpointState("endpoint-b", "https://custom.com", "key", "")
 	hm.AddEndpoint(epA)
 	hm.AddEndpoint(epB)
 
@@ -84,7 +84,7 @@ func TestHealthHandlerReturnsUnhealthyWhenAllDisabled(t *testing.T) {
 	hm := endpoint.NewHealthManager(endpoint.HealthConfig{FailuresToDisable: 1})
 	m := metrics.NewMetrics("test_health")
 
-	epA := endpoint.NewEndpointState("endpoint-a", "https://api.anthropic.com", "key")
+	epA := endpoint.NewEndpointState("endpoint-a", "https://api.anthropic.com", "key", "")
 	hm.AddEndpoint(epA)
 
 	epA.Disable()
@@ -114,7 +114,7 @@ func TestHealthHandlerReturnsStats(t *testing.T) {
 	hm := endpoint.NewHealthManager(endpoint.HealthConfig{FailuresToDisable: 5})
 	m := metrics.NewMetrics("test_stats")
 
-	ep := endpoint.NewEndpointState("gzl", "https://open.bigmodel.cn", "key")
+	ep := endpoint.NewEndpointState("gzl", "https://open.bigmodel.cn", "key", "")
 	hm.AddEndpoint(ep)
 
 	// Record some requests

@@ -9,7 +9,7 @@ import (
 )
 
 func TestEndpointStateIncrementConnection(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	if state.GetConnectionCount("claude-sonnet-4") != 0 {
 		t.Errorf("initial count = %d, want 0", state.GetConnectionCount("claude-sonnet-4"))
@@ -27,7 +27,7 @@ func TestEndpointStateIncrementConnection(t *testing.T) {
 }
 
 func TestEndpointStateDecrementConnection(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	state.IncrementConnection("claude-sonnet-4")
 	state.IncrementConnection("claude-sonnet-4")
@@ -39,7 +39,7 @@ func TestEndpointStateDecrementConnection(t *testing.T) {
 }
 
 func TestEndpointStateConcurrentConnections(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
@@ -70,7 +70,7 @@ func TestEndpointStateConcurrentConnections(t *testing.T) {
 }
 
 func TestEndpointStateDifferentModels(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	state.IncrementConnection("claude-sonnet-4")
 	state.IncrementConnection("claude-opus-4")
@@ -84,7 +84,7 @@ func TestEndpointStateDifferentModels(t *testing.T) {
 }
 
 func TestEndpointStateDisabled(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	if state.IsDisabled() {
 		t.Error("initial state should not be disabled")
@@ -102,7 +102,7 @@ func TestEndpointStateDisabled(t *testing.T) {
 }
 
 func TestEndpointStateFailureTracking(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	if state.GetFailures() != 0 {
 		t.Errorf("initial failures = %d, want 0", state.GetFailures())
@@ -130,10 +130,16 @@ func TestEndpointStateFailureTracking(t *testing.T) {
 	if state.GetFailures() != 0 {
 		t.Errorf("after reset = %d, want 0", state.GetFailures())
 	}
+	if reason := state.GetLastFailureReason(); reason != "" {
+		t.Errorf("lastFailureReason after reset = %q, want empty", reason)
+	}
+	if !state.GetLastFailureTime().IsZero() {
+		t.Error("lastFailureTime should be zero after reset")
+	}
 }
 
 func TestEndpointStateLastRequestTime(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	if !state.GetLastRequestTime().IsZero() {
 		t.Error("initial lastRequestTime should be zero")
@@ -148,22 +154,30 @@ func TestEndpointStateLastRequestTime(t *testing.T) {
 }
 
 func TestWithTimeout(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
-	original := state.Client.Timeout
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
-	state.WithTimeout(30 * time.Second)
-	if state.Client.Timeout != 30*time.Second {
-		t.Errorf("timeout = %v, want 30s", state.Client.Timeout)
+	// Default: no Client.Timeout, Transport has ResponseHeaderTimeout
+	if state.Client.Timeout != 0 {
+		t.Errorf("Client.Timeout = %v, want 0 (no overall timeout)", state.Client.Timeout)
+	}
+	transport, ok := state.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("Client.Transport should be *http.Transport")
+	}
+	if transport.ResponseHeaderTimeout == 0 {
+		t.Error("Transport.ResponseHeaderTimeout should not be zero")
 	}
 
-	state.WithTimeout(original)
-	if state.Client.Timeout != original {
-		t.Errorf("timeout = %v, want %v", state.Client.Timeout, original)
+	// WithTimeout should update ResponseHeaderTimeout
+	state.WithTimeout(30 * time.Second)
+	transport = state.Client.Transport.(*http.Transport)
+	if transport.ResponseHeaderTimeout != 30*time.Second {
+		t.Errorf("ResponseHeaderTimeout = %v, want 30s", transport.ResponseHeaderTimeout)
 	}
 }
 
 func TestGetTotalConnections(t *testing.T) {
-	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key")
+	state := NewEndpointState("endpoint-a", "https://api.anthropic.com", "test-key", "")
 
 	state.IncrementConnection("model-a")
 	state.IncrementConnection("model-a")
@@ -182,6 +196,32 @@ func TestGetTotalConnections(t *testing.T) {
 	}
 }
 
+func TestSupportedModels(t *testing.T) {
+	state := NewEndpointState("test-endpoint-models", "https://api.example.com", "key", "")
+
+	// Initially nil/empty
+	models := state.GetSupportedModels()
+	if models == nil {
+		t.Errorf("expected empty map, got nil")
+	}
+
+	// Set supported models
+	state.SetSupportedModels([]string{"glm-4.5-air", "glm-5.1"})
+	models = state.GetSupportedModels()
+	if len(models) != 2 {
+		t.Errorf("expected 2 models, got %d", len(models))
+	}
+	if !state.SupportsModel("glm-4.5-air") {
+		t.Error("expected SupportsModel(glm-4.5-air) = true")
+	}
+	if !state.SupportsModel("glm-5.1") {
+		t.Error("expected SupportsModel(glm-5.1) = true")
+	}
+	if state.SupportsModel("unknown-model") {
+		t.Error("expected SupportsModel(unknown-model) = false")
+	}
+}
+
 func TestVerify(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -189,7 +229,7 @@ func TestVerify(t *testing.T) {
 		}))
 		defer server.Close()
 
-		state := NewEndpointState("test", server.URL, "test-key")
+		state := NewEndpointState("test-verify-", server.URL, "test-key", "")
 		if err := state.Verify("claude-sonnet-4"); err != nil {
 			t.Errorf("Verify() error = %v", err)
 		}
@@ -201,7 +241,7 @@ func TestVerify(t *testing.T) {
 		}))
 		defer server.Close()
 
-		state := NewEndpointState("test", server.URL, "test-key")
+		state := NewEndpointState("test-verify-", server.URL, "test-key", "")
 		if err := state.Verify("claude-sonnet-4"); err == nil {
 			t.Error("Verify() should fail for 401")
 		}
@@ -213,7 +253,7 @@ func TestVerify(t *testing.T) {
 		}))
 		defer server.Close()
 
-		state := NewEndpointState("test", server.URL, "test-key")
+		state := NewEndpointState("test-verify-", server.URL, "test-key", "")
 		if err := state.Verify("claude-sonnet-4"); err == nil {
 			t.Error("Verify() should fail for 429")
 		}
@@ -225,7 +265,7 @@ func TestVerify(t *testing.T) {
 		}))
 		defer server.Close()
 
-		state := NewEndpointState("test", server.URL, "test-key")
+		state := NewEndpointState("test-verify-", server.URL, "test-key", "")
 		if err := state.Verify("claude-sonnet-4"); err == nil {
 			t.Error("Verify() should fail for 500")
 		}
@@ -238,7 +278,7 @@ func TestVerify(t *testing.T) {
 		}))
 		defer server.Close()
 
-		state := NewEndpointState("test", server.URL, "test-key")
+		state := NewEndpointState("test-verify-", server.URL, "test-key", "")
 		state.WithTimeout(100 * time.Millisecond)
 		if err := state.Verify("claude-sonnet-4"); err == nil {
 			t.Error("Verify() should timeout")
