@@ -1,8 +1,8 @@
 # Anthropic Transparent Proxy - System Architecture
 
-**Date:** 2026-04-22
-**Status:** Draft
-**Version:** 1.0
+**Date:** 2026-05-25
+**Status:** Current
+**Version:** 2.0
 
 ---
 
@@ -13,8 +13,8 @@
 Claude Code only supports a single Anthropic API endpoint, creating several operational challenges:
 
 1. **Multi-endpoint limitation**: Organizations need to route requests across multiple Anthropic API providers (official API, custom providers, different regions) but Claude Code cannot natively support this
-2. **Model name mismatch**: Backend providers may use different model names than Claude Code expects
-3. **No automatic failover**: If one endpoint fails, Claude Code cannot automatically retry on another endpoint
+2. **No automatic failover**: If one endpoint fails or is rate-limited, Claude Code cannot automatically retry on another endpoint
+3. **No endpoint health awareness**: Claude Code has no visibility into endpoint health, latency, or capacity
 4. **Existing solutions have critical limitations**: Current open source proxy solutions (one-api, LiteLLM) introduce format conversion issues, database requirements, and unnecessary complexity
 
 ### Solution Overview
@@ -22,24 +22,26 @@ Claude Code only supports a single Anthropic API endpoint, creating several oper
 A **transparent Anthropic API proxy** designed specifically for Claude Code compatibility:
 
 - Presents a single Anthropic-compatible endpoint to Claude Code
-- Load balances across multiple upstream Anthropic endpoints
-- Maps frontend model names to backend model pools
-- Fails over automatically on errors
+- Discovers supported models from each backend via `/v1/models` at startup and periodically
+- Load balances across multiple upstream Anthropic endpoints using least-connections
+- Retries on HTTP 429 (rate limit) across available endpoints
+- Automatically disables failing endpoints and probes for recovery
 - **Stateless deployment** - no database required
+- **Zero modification** - request body forwarded completely unchanged, preserving all Anthropic features
 - **Transparent streaming** - native Anthropic SSE format preserved
-- **Minimal modification** - only replaces model name in request body
 
 ### Key Differentiators
 
 | Feature | This Solution | one-api | LiteLLM |
 |---------|---------------|---------|---------|
 | Database Required | No | Yes (SQLite/MySQL) | Optional |
-| Format Conversion | Minimal (model name only) | OpenAI→Anthropic | Multi-format |
+| Format Conversion | None | OpenAI→Anthropic | Multi-format |
 | Anthropic Native | Full | Partial | Partial |
 | Stateless | Yes | No | Partial |
 | Claude Code Tool Use | Fully compatible | May have issues | May have issues |
 | Deployment Complexity | Single binary | Database + migrations | Python runtime |
 | Extended Thinking | Supported | Unknown | Unknown |
+| Model Discovery | Dynamic (/v1/models) | Static config | Static config |
 
 ---
 
@@ -189,7 +191,7 @@ Format conversion during streaming can:
 |--------|---------|---------|---------------|
 | **Language** | Go | Python | Go |
 | **Database** | Required | Optional | Not required |
-| **Format** | OpenAI→Anthropic | Multi-format | Anthropic native |
+| **Format** | OpenAI→Anthropic | Multi-format | Anthropic native (unchanged) |
 | **Auth** | Required | Optional | None (trust boundary at network) |
 | **Tool Use** | May have issues | May have issues | Fully compatible |
 | **Streaming** | SSE conversion | SSE conversion | Transparent SSE |
@@ -197,6 +199,7 @@ Format conversion during streaming can:
 | **Extended Thinking** | Unknown | Unknown | Supported |
 | **Prompt Caching** | Unknown | Unknown | Supported |
 | **Stateless** | No | Partial | Yes |
+| **Model Discovery** | Static config | Static config | Dynamic /v1/models |
 
 ---
 
@@ -341,33 +344,32 @@ Existing solutions with database requirements cannot be truly stateless. This pr
 │                    Transparent Proxy                             │
 │                                                                  │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │ HTTP Server │──│ Model Router │──│ Load Balancer        │   │
-│  │ (net/http)  │  │              │  │ (least-connections)  │   │
+│  │ HTTP Server │──│ Model        │──│ Load Balancer        │   │
+│  │ (net/http)  │  │ Discovery    │  │ (least-connections)  │   │
 │  └─────────────┘  └──────────────┘  └──────────────────────┘   │
 │         │                │                     │                 │
 │         │                │                     │                 │
 │         ▼                ▼                     ▼                 │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │ Endpoint    │  │ Endpoint Pool│  │ Connection Tracker   │   │
+│  │ Endpoint    │  │ Health       │  │ Connection Tracker   │   │
 │  │ Health      │  │ Manager      │  │ (per-model)          │   │
 │  └─────────────┘  └──────────────┘  └──────────────────────┘   │
 │         │                                                       │
 │         ▼                                                       │
 │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
-│  │ Metrics     │  │ Access Logger│  │ Health Checker       │   │
-│  │ (Prometheus)│  │              │  │                      │   │
+│  │ Metrics     │  │ Health       │  │ Models Handler       │   │
+│  │ (Prometheus)│  │ Checker+HTML │  │ (/v1/models)         │   │
 │  └─────────────┘  └──────────────┘  └──────────────────────┘   │
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │                    YAML Configuration File                   ││
 │  │  - Endpoints & API Keys                                      ││
-│  │  - Model Mappings                                            ││
-│  │  - Load Balancing Strategy                                   ││
 │  │  - Health Check Parameters                                   ││
+│  │  - Server & Logging Settings                                 ││
 │  └─────────────────────────────────────────────────────────────┘│
 └────────────────────────────┬────────────────────────────────────┘
-                             │ Proxied requests (native Anthropic format)
-                             │ Only modification: model name in request body
+                             │ Proxied requests (unchanged body)
+                             │ Only modification: Authorization header + URL
                              ▼
         ┌────────────────────┬────────────────────┬────────────────────┐
         │                    │                    │                    │
@@ -379,19 +381,20 @@ Existing solutions with database requirements cannot be truly stateless. This pr
 └───────────────┘  └───────────────┘  └───────────────┘  └───────────────┘
 ```
 
-### Key Design Principle: Transparency
+### Key Design Principle: Zero Modification Transparency
 
 **What passes through unchanged:**
-- Request headers (except x-api-key per endpoint)
-- Request body (except `model` field)
+- Request body (including `model` field)
+- All request headers (except Authorization)
 - Response headers
 - Response body (SSE streaming events)
 - All Anthropic-specific features (tool use, extended thinking, prompt caching)
 
 **What is modified:**
-- `model` field in request body (frontend model → backend model name)
-- `x-api-key` header (proxy endpoint key → backend endpoint key)
+- `Authorization` header (proxy endpoint key → backend endpoint key)
 - Target URL (proxy endpoint → selected backend endpoint)
+
+This is the core differentiator: **the request body is never modified.** Claude Code sends whatever model name it knows, and the proxy routes to backends that have discovered support for that model name. If a backend uses a different model name internally, it must be exposed as an alias via its `/v1/models` endpoint.
 
 ---
 
@@ -400,14 +403,32 @@ Existing solutions with database requirements cannot be truly stateless. This pr
 | Component | Responsibility | Why Needed |
 |-----------|---------------|------------|
 | **HTTP Server** | Accept Anthropic API requests, handle streaming responses | Entry point for Claude Code |
-| **Model Router** | Parse request model, resolve to backend model pool | Enable model name mapping |
-| **Load Balancer** | Select endpoint from pool using least-connections | Distribute load, avoid hot endpoints |
+| **Model Discovery** | Probe each endpoint's `/v1/models`, build model→endpoints map | Know which endpoints serve which models |
+| **Load Balancer** | Select endpoint from candidates using least-connections | Distribute load, avoid hot endpoints |
 | **Connection Tracker** | Track active connections per model per endpoint | Enable intelligent load balancing |
-| **Endpoint Health** | Monitor endpoint health, disable/re-enable endpoints | Automatic failover capability |
-| **Endpoint Pool Manager** | Manage endpoint configurations and weights | Support weighted distribution |
-| **Metrics Collector** | Expose Prometheus metrics | Observability without database |
-| **Access Logger** | Structured access logging | Usage tracking via logs |
-| **Health Checker** | `/health` endpoint and periodic endpoint health checks | Kubernetes readiness probes |
+| **Health Manager** | Monitor failures, disable/re-enable endpoints | Automatic failover |
+| **Recovery Probe** | Periodically test disabled endpoints with real requests | Auto-recovery when backends heal |
+| **Metrics Collector** | Expose Prometheus metrics + in-memory latency stats | Observability without database |
+| **Health Checker** | `/health` endpoint with JSON and HTML dashboard | Monitoring and readiness probes |
+| **Models Handler** | `/v1/models` endpoint returning union of healthy endpoint models | Model discovery for clients |
+
+---
+
+### Why Model Discovery Instead of Static Config
+
+Traditional proxies statically configure which models route to which backends. This proxy uses **dynamic model discovery**:
+
+1. At startup, each endpoint's `/v1/models` endpoint (or custom `models_endpoint`) is called
+2. The returned model IDs are stored per endpoint: `{ "claude-sonnet-4-20250514": ["aliyun", "gzl"], ... }`
+3. When a request arrives, the proxy looks up which endpoints support the requested model name
+4. Discovery refreshes every 5 minutes to pick up new models
+
+**Why this approach:**
+- No need to manually sync model names across providers
+- If a provider adds a new model, it's automatically available
+- If a provider removes a model, it's automatically excluded
+- Works even when providers use the same model names as Anthropic's official API
+- Falls back gracefully: if discovery fails, a default probe model is used for health checks
 
 ---
 
@@ -416,12 +437,12 @@ Existing solutions with database requirements cannot be truly stateless. This pr
 Traditional load balancers track connections per endpoint. This proxy tracks per **model per endpoint**:
 
 ```
-endpoint-a connections:
+aliyun connections:
   ├── claude-sonnet-4-20250514: 5  (endpoint supports this model)
   ├── claude-opus-4-20250514: 2    (endpoint supports this model)
   └── total: 7
 
-endpoint-b connections:
+gzl connections:
   ├── claude-sonnet-4-20250514: 3  (endpoint supports this model)
   └── total: 3                     (endpoint doesn't have opus)
 ```
@@ -440,9 +461,9 @@ endpoint-b connections:
 
 ```
 Request for claude-sonnet-4-20250514 arrives:
-  endpoint-a: 5 connections for this model
-  endpoint-b: 3 connections for this model ← SELECTED
-  endpoint-c: 4 connections for this model
+  aliyun: 5 connections for this model
+  gzl: 3 connections for this model ← SELECTED
+  minimax: 4 connections for this model
 ```
 
 **Advantages over round-robin:**
@@ -457,11 +478,10 @@ Request for claude-sonnet-4-20250514 arrives:
 
 **Configuration via YAML file:**
 ```yaml
-# proxy.yaml - single file contains all config
 endpoints:
-  endpoint-a:
+  aliyun:
     url: "https://api.anthropic.com"
-    api_key: "${ANTHROPIC_API_KEY_A}"
+    api_key: "${ANTHROPIC_API_KEY}"
 ```
 
 **Advantages:**
@@ -489,131 +509,127 @@ Client Request (Anthropic native format)
      ▼
 ┌─────────────────┐
 │ 1. Parse Model  │  Extract "model" field from request body
-│                 │  Request format preserved (no conversion)
+│                 │  Body preserved unchanged (no conversion)
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│ 2. Resolve Pool │  Lookup model in config → get backend pool
-│                 │  Pool contains: endpoints, weights, backend model names
+│ 2. Lookup       │  Find endpoints that support this model
+│    Endpoints    │  (from dynamic model discovery)
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│ 3. Select       │  Apply least-connections:
-│    Backend      │  - Get connection counts for this model per endpoint
-│                 │  - Filter out disabled/unhealthy endpoints
+│ 3. Filter       │  Remove disabled endpoints
+│    Healthy      │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ 4. Select       │  Least-connections among remaining candidates
+│    Backend      │  - Get connection count for this model per endpoint
 │                 │  - Select endpoint with lowest count
 └────────┬────────┘
          │
-         ▼
+    ┌────┴─────────────┐
+    │                  │
+ Found endpoint    None found
+    │                  │
+    ▼                  ▼
+    │           Return 503:
+    │           "model not supported
+    │            by any endpoint"
+    │
+    ▼
 ┌─────────────────┐
-│ 4. Check Health │  Is endpoint healthy?
-│                 │  - Not disabled by failure threshold?
-│                 │  - Recent successful requests?
+│ 5. Forward      │  Modify only: Authorization header, target URL
+│    Request      │  Body sent completely unchanged
+│                 │  Header: Authorization → Bearer {ep.APIKey}
+│                 │  URL: proxy → selected endpoint URL
 └────────┬────────┘
          │
-    ┌────┴────┐
-    │         │
-   YES       NO
-    │         │
-    ▼         ▼
-    │    ┌─────────────────┐
-    │    │ Try Next Backend │  Fallback to next healthy endpoint
-    │    │ (by connection   │
-    │    │  count)          │
-    │    └────────┬────────┘
-    │             │
-    └──────┬──────┘
-           │
-           ▼
-┌─────────────────────┐
-│ 5. Increment Count  │  Track active connection for model-endpoint pair
-│                     │  Connection tracker: atomic increment
-└────────┬────────────┘
-         │
          ▼
-┌─────────────────────┐
-│ 6. Forward Request  │  Modify only: model name, API key, target URL
-│                     │  Body: {"model": "claude-sonnet-4"} → {"model": "custom-sonnet"}
-│                     │  Header: x-api-key → endpoint's key
-│                     │  URL: proxy → selected endpoint URL
-└────────┬────────────┘
+┌─────────────────┐
+│ 6. Stream       │  Transparent SSE streaming:
+│    Response     │  - Receive SSE events from backend
+│                 │  - Forward to client immediately
+│                 │  - No buffering, no conversion
+│                 │  - http.Flusher for real-time delivery
+└────────┬────────┘
          │
-         ▼
-┌─────────────────────┐
-│ 7. Stream Response  │  Transparent SSE streaming:
-│                     │  - Receive event from backend
-│                     │  - Forward to client immediately
-│                     │  - No buffering, no conversion
-│                     │  - http.Flusher for real-time delivery
-└────────┬────────────┘
-         │
-    ┌────┴────┐
-    │         │
- SUCCESS   FAILURE
-    │         │
-    ▼         ▼
+    ┌────┴────────────┐
+    │                 │
+  2xx              429 (rate limited)
+    │                 │
+    ▼                 ▼
 ┌─────────┐  ┌──────────────────┐
-│ Record  │  │ Record Failure    │
-│ Success │  │ - Increment failure count
-│ Decrement│  │ - Decrement connection
-│ Count   │  │ - May disable endpoint
-│ Done    │  │ - Retry next endpoint
+│ Success │  │ Record Failure    │
+│ Record  │  │ - Decrement conn  │
+│ Success │  │ - Retry next      │
+│ Done    │  │   endpoint (step 4)│
 └─────────┘  └──────────────────┘
+                  │
+             ┌────┴────┐
+             │         │
+         Other 4xx/5xx
+             │
+             ▼
+      ┌──────────────────┐
+      │ Return error      │
+      │ response to client│
+      │ (no retry)        │
+      └──────────────────┘
 ```
 
-### Failover Behavior
+### Retry Behavior (429 Only)
+
+The proxy **only retries on HTTP 429 (rate limiting)**. This is an intentional design choice:
+- 5xx errors, timeouts, and connection failures are returned to the client immediately
+- The client (Claude Code) can then decide to retry, which will hit the proxy's load balancer again — potentially selecting a different endpoint
+- 429 is the one case where transparent retry adds clear value: rate limits are transient and endpoint-specific
+- Retrying on 5xx would mask upstream bugs and add latency for errors the client should see
 
 ```
 Request arrives for claude-sonnet-4-20250514
          │
          ▼
 ┌─────────────────────────────────────────────────────┐
-│ Attempt 1: endpoint-b (least connections: 3)       │
+│ Attempt 1: aliyun (least connections: 3)            │
 │ Connection count: 3 → 4                            │
 └─────────────────────────────────────────────────────┘
          │
     ┌────┴────┐
     │         │
- SUCCESS   FAILURE (timeout/5xx/connection error)
+ SUCCESS   429 (rate limited)
     │         │
     ▼         ▼
-   DONE    ┌─────────────────────────────────────────┐
-           │ Record failure for endpoint-b           │
-           │ Failure count: 0 → 1                    │
-           │ If failures >= 5: disable endpoint-b    │
-           │ Connection count: 4 → 3                 │
-           └─────────────────────────────────────────┘
-                    │
-                    ▼
-           ┌─────────────────────────────────────────┐
-           │ Attempt 2: endpoint-c (next least: 4)   │
-           │ Connection count: 4 → 5                 │
-           └─────────────────────────────────────────┘
-                    │
-               ┌────┴────┐
-               │         │
-            SUCCESS   FAILURE
-               │         │
-               ▼         ▼
-              DONE    Try endpoint-a (count: 5)
-                       │
-                       ▼
-                    (all endpoints failed or disabled)
-                       │
-                       ▼
-              Return HTTP 503 to client
-              {
-                "type": "error",
-                "error": {
-                  "type": "api_error",
-                  "message": "All endpoints unavailable"
-                }
-              }
+   DONE   ┌─────────────────────────────────────────┐
+          │ Decrement connection: 4 → 3             │
+          │ Record failure on aliyun                │
+          │ (may disable if failures >= threshold)  │
+          └─────────────────────────────────────────┘
+                   │
+                   ▼
+          ┌─────────────────────────────────────────┐
+          │ Attempt 2: minimax (next least: 4)      │
+          │ Connection count: 4 → 5                 │
+          └─────────────────────────────────────────┘
+                   │
+              ┌────┴────┐
+              │         │
+           SUCCESS   429 / non-2xx
+              │         │
+              ▼         ▼
+             DONE   (all endpoints exhausted)
+                      │
+                      ▼
+             Return HTTP 503 to client
+             "no backend available"
 ```
 
-### Recovery Probe Flow
+### Endpoint Health & Recovery
+
+When an endpoint accumulates `failures_to_disable` consecutive failures (default: 5), it is automatically disabled. A background goroutine probes disabled endpoints every `recovery_probe_interval` (default: 30s) by sending a real POST `/v1/messages` request. If `successes_to_enable` consecutive probes succeed (default: 2), the endpoint is re-enabled.
 
 ```
 Background goroutine (every 30 seconds):
@@ -622,16 +638,15 @@ Background goroutine (every 30 seconds):
 ┌─────────────────────────────────────────────────────┐
 │ For each disabled endpoint:                         │
 │                                                     │
-│ 1. Send lightweight health check                    │
-│    - HEAD request to base URL (no API cost)         │
-│    - Or minimal messages request (verify API)       │
+│ 1. Send real POST /v1/messages verification         │
+│    with endpoint's probe model                      │
 │                                                     │
-│ 2. If success:                                      │
-│    - Increment success count                        │
-│    - If successes >= 2: re-enable endpoint          │
+│ 2. If success (HTTP 200):                           │
+│    - Increment success counter                      │
+│    - If successes >= 2: re-enable endpoint           │
 │                                                     │
-│ 3. If failure:                                      │
-│    - Reset success count to 0                       │
+│ 3. If failure (non-200 / network error):            │
+│    - Reset success counter to 0                     │
 │    - Keep endpoint disabled                         │
 └─────────────────────────────────────────────────────┘
 ```
@@ -679,14 +694,13 @@ Background goroutine (every 30 seconds):
 
 **Rationale:**
 - Runtime state (connection counts) is ephemeral - lost on restart is acceptable
-- Configuration (endpoints, models) is static - YAML is sufficient
+- Configuration (endpoints, keys) is static - YAML is sufficient
 - Usage tracking via logs/metrics (Prometheus) - no database needed
 - Deployment simplicity is paramount for Claude Code proxy use case
-- Kubernetes ConfigMap enables dynamic config updates without restart
 
 ---
 
-### Decision 3: Minimal Format Modification
+### Decision 3: Zero Modification (Not Minimal)
 
 **Problem:** Should we convert between API formats for flexibility?
 
@@ -695,21 +709,45 @@ Background goroutine (every 30 seconds):
 | Approach | Pros | Cons |
 |----------|------|------|
 | Full OpenAI compatibility | More clients supported | Tool use incompatibility, complexity |
-| Anthropic native only | Claude Code compatible | Limited to Anthropic clients |
-| Minimal modification (model name only) | Claude Code compatible, simple | No format conversion benefits |
+| Model name rewriting | Flexible naming | Body modification, streaming issues |
+| Zero modification | All features preserved, simple | Backends must support the model names clients use |
 
-**Decision:** Minimal modification (model name only)
+**Decision:** Zero modification — request body forwarded unchanged
 
 **Rationale:**
-- Claude Code uses Anthropic native format - conversion introduces risk
+- Claude Code uses Anthropic native format — any modification introduces risk
+- Model name rewriting requires parsing and modifying streaming bodies, which is fragile
+- Dynamic model discovery means backends declare what model names they support
 - Tool use is tightly coupled to Anthropic format
 - Extended thinking, prompt caching have no OpenAI equivalents
+- Anthropic's API protocol evolves over time (new event types, new fields, thinking blocks, etc.) — any body modification logic would need ongoing maintenance to stay compatible with protocol changes. Zero modification means the proxy automatically supports new protocol features without code changes.
 - Simplicity reduces bugs and maintenance
-- Target use case is Claude Code specifically, not general LLM proxy
 
 ---
 
-### Decision 4: Go as Implementation Language
+### Decision 4: Retry Only on 429
+
+**Problem:** When should the proxy transparently retry on another endpoint?
+
+**Options Considered:**
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Retry on all errors | Max availability | Masks upstream bugs, adds latency |
+| Retry on 5xx only | Handles transient failures | Client may retry anyway (double retry) |
+| Retry on 429 only | Handles rate limits, no masking | Client sees 5xx immediately |
+
+**Decision:** Retry only on HTTP 429
+
+**Rationale:**
+- Rate limits are endpoint-specific and transient — retrying another endpoint always makes sense
+- 5xx errors should be visible to the client so it can decide whether to retry
+- If the client retries a 5xx, the proxy's load balancer will naturally try a different endpoint
+- Avoids double-retry problems and latency amplification
+
+---
+
+### Decision 5: Go as Implementation Language
 
 **Problem:** What language to implement in?
 
@@ -738,72 +776,68 @@ Background goroutine (every 30 seconds):
 ### YAML Configuration Format
 
 ```yaml
-# proxy.yaml
 server:
   listen: ":8080"
   read_timeout: 30s
-  write_timeout: 120s    # Long timeout for streaming
+  write_timeout: 0s          # 0 = no timeout, important for SSE streaming
   idle_timeout: 90s
 
 logging:
-  level: info
-  format: json           # Structured for log aggregation
+  level: debug               # debug, info, warn, error
+  format: json               # Structured for log aggregation
 
 metrics:
   enabled: true
-  path: /metrics         # Prometheus endpoint
+  path: /metrics             # Prometheus endpoint
 
 health:
-  path: /health          # Kubernetes readiness probe
+  path: /health              # Health check + HTML dashboard
 
 routing:
   default_strategy: least-connections
 
-# Model mappings: frontend model → backend model pool
-models:
-  claude-sonnet-4-20250514:
-    backends:
-      - endpoint: endpoint-a
-        model: "claude-sonnet-4-20250514"
-        weight: 10
-      - endpoint: endpoint-b
-        model: "custom-sonnet-model"    # Provider uses different name
-        weight: 5
-      - endpoint: endpoint-c
-        model: "sonnet-v4"
-        weight: 5
-
-  claude-opus-4-20250514:
-    backends:
-      - endpoint: endpoint-a
-        model: "claude-opus-4-20250514"
-        weight: 10
-      - endpoint: endpoint-c
-        model: "opus-premium"
-        weight: 8
-
 # Endpoint definitions
+# Each endpoint represents an upstream Anthropic-compatible API
 endpoints:
-  endpoint-a:
-    url: "https://api.anthropic.com"
-    api_key: "${ANTHROPIC_API_KEY_A}"    # Environment variable
-    timeout: 90s
+  aliyun:
+    url: "https://api.example.com/anthropic"
+    api_key: "${ALIYUN_API_KEY}"            # ${ENV_VAR} or plain text
+    timeout: 300s                            # Response header timeout
+    models_endpoint: ""                      # Optional: custom URL for model discovery
+    offline: false                           # true = permanently excluded from routing
 
-  endpoint-b:
-    url: "https://custom-provider.example.com/v1"
-    api_key: "${CUSTOM_PROVIDER_KEY}"
-    timeout: 90s
-
-  endpoint-c:
-    url: "https://another-provider.io/anthropic"
-    api_key: "${ANOTHER_PROVIDER_KEY}"
-    timeout: 90s
+  gzl:
+    url: "https://open.example.cn/api/anthropic"
+    api_key: "${GZL_API_KEY}"
+    timeout: 300s
+    offline: false
 
 # Automatic endpoint health management
 endpoint_health:
-  failures_to_disable: 5
+  failures_to_disable: 5     # Consecutive failures before disabling
   recovery_probe_interval: 30s
-  successes_to_enable: 2
+  successes_to_enable: 2     # Consecutive successful probes to re-enable
+```
+
+### Endpoint Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `url` | string | Yes | Base URL of the Anthropic-compatible API |
+| `api_key` | string | Yes | API key. Supports `${ENV_VAR}` and `${ENV_VAR:-default}` |
+| `timeout` | duration | No | Response header timeout. Default: 90s |
+| `models_endpoint` | string | No | Custom URL for model discovery. Default: `{url}/v1/models` |
+| `offline` | bool | No | If true, endpoint is permanently excluded from routing |
+
+### Environment Variable Expansion
+
+The config supports `${VAR}` and `${VAR:-default}` syntax in `api_key` values. This lets you keep secrets out of the config file:
+
+```yaml
+endpoints:
+  production:
+    url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_PROD_KEY}"
 ```
 
 ---
@@ -817,7 +851,8 @@ endpoint_health:
 | Configuration | YAML with `gopkg.in/yaml.v3` | Human-readable, widely supported |
 | Metrics | Prometheus `client_golang` | Standard observability |
 | Testing | Go `testing` + `httptest` | Built-in, no external framework |
-| Logging | Structured JSON logs | Compatible with log aggregators |
+| Logging | `log/slog` (Go standard library) | Structured JSON logging |
+| Build | `go build` | Single binary |
 
 ---
 
@@ -827,37 +862,74 @@ endpoint_health:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `proxy_requests_total` | Counter | Total requests processed |
-| `proxy_requests_by_model` | Counter | Requests per model |
-| `proxy_requests_by_endpoint` | Counter | Requests per endpoint |
-| `proxy_request_duration_seconds` | Histogram | Request latency distribution |
-| `proxy_endpoint_connections` | Gauge | Active connections per endpoint |
-| `proxy_endpoint_failures_total` | Counter | Failures per endpoint |
-| `proxy_endpoint_enabled` | Gauge | Endpoint enabled status (1/0) |
+| `anthropic_proxy_requests_total` | Counter | Total requests processed |
+| `anthropic_proxy_requests_by_model` | Counter | Requests per model (frontend model name) |
+| `anthropic_proxy_requests_by_endpoint` | Counter | Requests per endpoint |
+| `anthropic_proxy_request_duration_seconds` | Histogram | Request latency distribution (by model + endpoint) |
+| `anthropic_proxy_endpoint_failures_total` | Counter | Failures per endpoint |
+| `anthropic_proxy_endpoint_enabled` | Gauge | Endpoint enabled status (1=enabled, 0=disabled) |
 
 ### Health Endpoint
 
-```bash
-# Kubernetes readiness probe
-GET /health
-Response: {"status": "healthy", "endpoints": {"endpoint-a": "enabled", "endpoint-b": "disabled"}}
-```
-
-### Access Logs
+**`GET /health`** returns JSON (or HTML dashboard when requested by a browser):
 
 ```json
 {
-  "timestamp": "2026-04-22T10:30:00Z",
-  "method": "POST",
-  "path": "/v1/messages",
-  "model": "claude-sonnet-4-20250514",
-  "endpoint": "endpoint-a",
-  "backend_model": "claude-sonnet-4-20250514",
-  "status": 200,
-  "duration_ms": 2340,
-  "streaming": true,
-  "tokens_input": 150,
-  "tokens_output": 500
+  "status": "healthy",
+  "total_requests": 15420,
+  "endpoints": {
+    "aliyun": {
+      "status": "enabled",
+      "requests": 8230,
+      "failures": 2,
+      "active_connections": 3,
+      "lastRequestTime": "2026-05-25T10:30:00Z",
+      "lastFailureTime": "2026-05-25T09:15:00Z",
+      "lastFailureReason": "status=429 body=...",
+      "supported_models": ["claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+    },
+    "gzl": {
+      "status": "disabled",
+      "requests": 4100,
+      "failures": 8,
+      "active_connections": 0,
+      "lastProbeTime": "2026-05-25T10:29:30Z",
+      "lastProbeSuccess": false,
+      "supported_models": ["claude-sonnet-4-20250514"]
+    }
+  },
+  "models": {
+    "claude-sonnet-4-20250514": {
+      "requests": 12000,
+      "latency": {"count": 12000, "min_ms": 1200, "max_ms": 45000, "avg_ms": 3200}
+    }
+  },
+  "by_backend": [
+    {
+      "frontend_model": "claude-sonnet-4-20250514",
+      "backend_model": "claude-sonnet-4-20250514",
+      "endpoint": "aliyun",
+      "latency": {"count": 8000, "min_ms": 1200, "max_ms": 30000, "avg_ms": 2800}
+    }
+  ]
+}
+```
+
+**Status values:**
+- `healthy` — all endpoints enabled
+- `degraded` — some endpoints disabled, but at least one enabled
+- `unhealthy` — no enabled endpoints
+
+### Structured Access Logs
+
+```json
+{
+  "time": "2026-05-25T10:30:00Z",
+  "level": "INFO",
+  "msg": "routing request",
+  "frontend_model": "claude-sonnet-4-20250514",
+  "endpoint": "aliyun",
+  "attempt": 1
 }
 ```
 

@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -8,26 +11,36 @@ import (
 	"time"
 
 	"github.com/anthropic-transparent-proxy/internal/endpoint"
+	"github.com/anthropic-transparent-proxy/internal/memory"
 	"github.com/anthropic-transparent-proxy/internal/metrics"
 )
 
 // Handler is the main proxy HTTP handler
 type Handler struct {
-	healthMgr *endpoint.HealthManager
-	metrics   *metrics.Metrics
-	logger    *slog.Logger
+	healthMgr         *endpoint.HealthManager
+	metrics           *metrics.Metrics
+	memoryClient      *memory.Client
+	usageFetcher      usageFetcher
+	usageVirtualConns float64
+	logger            *slog.Logger
 }
 
 // NewHandler creates a new proxy handler
 func NewHandler(
 	healthMgr *endpoint.HealthManager,
 	metrics *metrics.Metrics,
+	memoryClient *memory.Client,
+	usageFetcher usageFetcher,
+	usageVirtualConns float64,
 	logger *slog.Logger,
 ) *Handler {
 	return &Handler{
-		healthMgr: healthMgr,
-		metrics:   metrics,
-		logger:    logger,
+		healthMgr:         healthMgr,
+		metrics:           metrics,
+		memoryClient:      memoryClient,
+		usageFetcher:      usageFetcher,
+		usageVirtualConns: usageVirtualConns,
+		logger:            logger,
 	}
 }
 
@@ -75,6 +88,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	filterFallbackEndpoints(supportedEndpoints)
+
 	maxAttempts := len(supportedEndpoints)
 
 	// Retry loop for 429 responses
@@ -84,8 +99,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var selectedEp *endpoint.EndpointState
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		// Select least-connections endpoint from supported endpoints
-		ep := h.selectLeastConnectionsEndpoint(frontendModel, supportedEndpoints, attempted)
+		ep := h.selectEndpoint(frontendModel, supportedEndpoints, attempted)
 		if ep == nil {
 			break // no more endpoints available
 		}
@@ -100,7 +114,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Track connection
 		ep.IncrementConnection(frontendModel)
 
-		// Create upstream request - forward body unchanged (no model rewriting)
+		// Resolve backend model name and rewrite if needed
+		backendModel := ep.BackendModelFor(frontendModel)
+		forwardBody := bodyBytes
+		if backendModel != frontendModel {
+			var rewriteErr error
+			forwardBody, rewriteErr = RewriteModel(bodyBytes, backendModel)
+			if rewriteErr != nil {
+				h.logger.Warn("failed to rewrite model, forwarding unchanged", "error", rewriteErr)
+				forwardBody = bodyBytes
+			}
+		}
+
+		// Create upstream request
 		upstreamReq, err := http.NewRequest(r.Method, ep.URL+r.URL.Path, nil)
 		if err != nil {
 			ep.DecrementConnection(frontendModel)
@@ -112,9 +138,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Propagate client context so upstream is cancelled if client disconnects
 		upstreamReq = upstreamReq.WithContext(r.Context())
 
-		// Set body from original content (no model replacement)
-		upstreamReq.ContentLength = int64(len(bodyBytes))
-		upstreamReq.Body = &closingReader{src: bodyBytes}
+		upstreamReq.ContentLength = int64(len(forwardBody))
+		upstreamReq.Body = &closingReader{src: forwardBody}
 
 		// Copy headers, replacing auth
 		for key, values := range r.Header {
@@ -158,6 +183,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no backend available", http.StatusServiceUnavailable)
 		return
 	}
+
+	// Compute backendModel for the selected endpoint (needed for reverse rewriting)
+	backendModel := selectedEp.BackendModelFor(frontendModel)
+	h.logger.Debug("selected endpoint", "endpoint", selectedEp.Name, "frontend_model", frontendModel, "backend_model", backendModel)
 
 	defer resp.Body.Close()
 	defer selectedEp.DecrementConnection(frontendModel)
@@ -203,20 +232,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Stream response body directly (no model replacement)
 	if parsedReq.Stream {
 		flusher, canFlush := w.(http.Flusher)
-		buf := make([]byte, 32*1024)
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-		for {
-			n, readErr := resp.Body.Read(buf)
-			if n > 0 {
-				if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-					break
-				}
-				if canFlush {
-					flusher.Flush()
+		for scanner.Scan() {
+			line := scanner.Bytes()
+
+			// Rewrite model in message_start events if needed
+			if backendModel != frontendModel && bytes.HasPrefix(line, []byte("data: ")) {
+				rewritten, changed := RewriteModelInSSE(line, frontendModel)
+				if changed {
+					line = rewritten
 				}
 			}
-			if readErr != nil {
-				break
+
+			w.Write(line)
+			w.Write([]byte("\n"))
+			if canFlush {
+				flusher.Flush()
 			}
 		}
 	} else {
@@ -235,27 +268,61 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// Reverse rewrite: restore frontend model name in response
+		if backendModel != frontendModel {
+			body, err = RewriteModelInResponse(body, frontendModel)
+			if err != nil {
+				h.logger.Warn("failed to rewrite model in response, forwarding unchanged", "error", err)
+			}
+		}
+
 		w.Write(body)
 	}
+
+	// Record conversation to memory (fire-and-forget)
+	h.recordConversation(parsedReq, bodyBytes, start)
 }
 
 // selectLeastConnectionsEndpoint selects the endpoint with the lowest connection count
-func (h *Handler) selectLeastConnectionsEndpoint(model string, endpoints map[string]*endpoint.EndpointState, exclude map[string]bool) *endpoint.EndpointState {
-	var selected *endpoint.EndpointState
-	minLoad := float64(-1)
-
-	for _, ep := range endpoints {
-		if exclude[ep.Name] {
-			continue
-		}
-		count := ep.GetConnectionCount(model)
-		if selected == nil || float64(count) < minLoad {
-			selected = ep
-			minLoad = float64(count)
-		}
+// recordConversation sends the conversation to Mem0 for memory recording.
+func (h *Handler) recordConversation(parsedReq *AnthropicRequest, reqBody []byte, start time.Time) {
+	if h.memoryClient == nil {
+		return
 	}
 
-	return selected
+	var wrapper struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(reqBody, &wrapper); err != nil {
+		return
+	}
+
+	// Only keep the last 4 messages (2 turns) to stay within embedding limits.
+	msgs := wrapper.Messages
+	if len(msgs) > 4 {
+		msgs = msgs[len(msgs)-4:]
+	}
+	memMessages := make([]memory.Message, 0, len(msgs))
+	for _, m := range msgs {
+		contentStr, _ := json.Marshal(m.Content)
+		memMessages = append(memMessages, memory.Message{
+			Role:    m.Role,
+			Content: string(contentStr),
+		})
+	}
+
+	h.memoryClient.RecordAsync(memory.ConversationRecord{
+		Messages: memMessages,
+		Metadata: memory.RecordMetadata{
+			Model:     parsedReq.Model,
+			Stream:    parsedReq.Stream,
+			Duration:  time.Since(start).Milliseconds(),
+			Timestamp: time.Now(),
+		},
+	})
 }
 
 // closingReader wraps a byte slice as an io.ReadCloser

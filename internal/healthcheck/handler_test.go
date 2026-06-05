@@ -19,7 +19,7 @@ func TestHealthHandlerReturnsHealthy(t *testing.T) {
 	hm.AddEndpoint(epA)
 	hm.AddEndpoint(epB)
 
-	handler := NewHandler(hm, m, nil)
+	handler := NewHandler(hm, m, nil, nil, nil)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	rec := httptest.NewRecorder()
@@ -59,7 +59,7 @@ func TestHealthHandlerReturnsDegradedWhenSomeDisabled(t *testing.T) {
 
 	epB.Disable()
 
-	handler := NewHandler(hm, m, nil)
+	handler := NewHandler(hm, m, nil, nil, nil)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	rec := httptest.NewRecorder()
@@ -89,7 +89,7 @@ func TestHealthHandlerReturnsUnhealthyWhenAllDisabled(t *testing.T) {
 
 	epA.Disable()
 
-	handler := NewHandler(hm, m, nil)
+	handler := NewHandler(hm, m, nil, nil, nil)
 
 	req := httptest.NewRequest("GET", "/health", nil)
 	rec := httptest.NewRecorder()
@@ -121,7 +121,7 @@ func TestHealthHandlerReturnsStats(t *testing.T) {
 	m.RecordRequest("claude-sonnet-4", "glm-5-turbo", "gzl", 0.5, true)
 	m.RecordRequest("claude-sonnet-4", "glm-5-turbo", "gzl", 1.5, true)
 
-	handler := NewHandler(hm, m, nil)
+	handler := NewHandler(hm, m, nil, nil, nil)
 	req := httptest.NewRequest("GET", "/health", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

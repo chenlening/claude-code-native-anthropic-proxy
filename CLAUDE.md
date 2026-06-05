@@ -26,6 +26,17 @@ What the installer does:
 - Strips old proxy env vars from `~/.claude/settings.json` (does not write new ones)
 - Installs the `claude-proxy` wrapper to `/usr/local/bin` as the primary launcher
 
+## Remote client install
+
+When a user wants to connect to a proxy running on a remote server (no local build needed), read `.claude/commands/install-remote-client.md` and follow those steps.
+
+What the remote client installer does:
+- Auto-detects local network IPs to suggest proxy URLs
+- Installs `jq` (needed for model selection)
+- Health-checks the proxy via direct HTTP
+- Deploys `claude-proxy-remote` wrapper with embedded connection config
+- Strips old proxy env vars from `~/.claude/settings.json`
+
 ## Uninstall
 
 When a user asks to uninstall, read `.claude/commands/uninstall.md` and follow those steps.
@@ -114,7 +125,9 @@ scripts/
 .claude/
   commands/
     install.md             # Unified installation steps (Linux + macOS)
+    install-remote-client.md # Remote client installation via SSH tunnel
     uninstall.md           # Uninstall steps (Linux + macOS)
 claude-proxy               # Wrapper launcher with interactive model picker
+claude-proxy-remote        # Remote wrapper with SSH tunnel support
 docs/                      # Documentation
 ```

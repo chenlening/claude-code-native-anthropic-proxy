@@ -1,9 +1,11 @@
 # Build output
 bin/
 /proxy
+/proxy-memory
 
 # Secrets
 configs/backends/
+deploy/.env
 
 # Internal docs
 docs/plans/
@@ -11,5 +13,9 @@ docs/plans/
 # Go coverage
 coverage.out
 
+# Public repo clone (local working copy)
+.public/
+
 # OS
 .DS_Store
+deploy/ollama_data/

@@ -1,0 +1,243 @@
+#!/bin/bash
+# Claude Code remote wrapper — connects to proxy via direct HTTP
+# No Go, no build, no local service, no SSH tunnel required
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# ── Connection config (set during install) ──────────────────────────────
+PROXY_URL="PLACEHOLDER_PROXY_URL"
+API_KEY="PLACEHOLDER_API_KEY"
+# ────────────────────────────────────────────────────────────────────────
+
+TEMP_SETTINGS="/tmp/claude-proxy-remote-settings-$$.json"
+
+cleanup() {
+    if [[ -f "$TEMP_SETTINGS" ]]; then
+        rm "$TEMP_SETTINGS"
+    fi
+}
+trap cleanup EXIT
+
+log_info()  { echo -e "${GREEN}✓${NC} $1"; }
+log_error() { echo -e "${RED}✗${NC} $1" >&2; }
+log_warn()  { echo -e "${YELLOW}⚠${NC} $1"; }
+
+# ── Health check ────────────────────────────────────────────────────────
+
+check_health() {
+    if curl -sf --noproxy '*' --max-time 5 "${PROXY_URL}/health" &>/dev/null; then
+        log_info "Proxy: responding (${PROXY_URL}/health)"
+        return
+    fi
+    log_error "Proxy not responding at ${PROXY_URL}"
+    echo ""
+    echo "Troubleshooting:"
+    echo "  1. Is the proxy running? Check with: curl ${PROXY_URL}/health"
+    echo "  2. Can you reach the server? ping <proxy-ip>"
+    echo "  3. Is the port open? nc -zv <proxy-ip> <port>"
+    exit 1
+}
+
+# ── Model selection ─────────────────────────────────────────────────────
+
+LAST_MODEL_FILE="$HOME/.claude-proxy-remote-last"
+
+_is_small_model() {
+    case "$1" in
+        *flash*|*turbo*|*highspeed*|*air*|*lite*|*mini*|*haiku*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+select_models() {
+    local models_json
+    models_json=$(curl -s --noproxy '*' "${PROXY_URL}/v1/models" 2>/dev/null)
+
+    if [[ -z "$models_json" ]] || ! echo "$models_json" | jq -e '.data' >/dev/null 2>&1; then
+        log_error "Failed to fetch models from proxy"
+        exit 1
+    fi
+
+    local model_ids
+    model_ids=($(echo "$models_json" | jq -r '.data[].id'))
+
+    if [[ ${#model_ids[@]} -eq 0 ]]; then
+        log_error "No models available"
+        exit 1
+    fi
+
+    local last_large=""
+    local last_small=""
+    if [[ -f "$LAST_MODEL_FILE" ]]; then
+        last_large=$(sed -n '1p' "$LAST_MODEL_FILE")
+        last_small=$(sed -n '2p' "$LAST_MODEL_FILE")
+    fi
+
+    _tag() {
+        if _is_small_model "$1"; then echo "small"; else echo "large"; fi
+    }
+
+    _show_menu() {
+        local cat="$1" label="$2" last_val="$3"
+        local idx=1 recommended=1
+
+        echo "" >/dev/tty
+        echo "Select ${label}:" >/dev/tty
+        echo "" >/dev/tty
+
+        for m in "${model_ids[@]}"; do
+            local tag="$(_tag "$m")"
+            local mark=""
+            if [[ "$m" == "$last_val" ]]; then
+                mark=" (default)"
+                recommended=$idx
+            elif [[ "$tag" == "$cat" && $recommended -eq 1 ]]; then
+                recommended=$idx
+            fi
+            printf "  %2d) %s (%s)%s\n" "$idx" "$m" "$tag" "$mark" >/dev/tty
+            ((idx++))
+        done
+
+        echo "$recommended"
+    }
+
+    _choose() {
+        local v
+        read -r v </dev/tty
+        echo "$v"
+    }
+
+    local default_large
+    default_large=$(_show_menu large "large model (Opus / Sonnet)" "$last_large")
+
+    echo ""
+    printf "  Enter number [%s]: " "$default_large"
+    local large_choice
+    large_choice=$(_choose)
+    large_choice="${large_choice:-$default_large}"
+
+    if [[ "$large_choice" =~ ^[0-9]+$ ]] && (( large_choice >= 1 && large_choice <= ${#model_ids[@]} )); then
+        SELECTED_LARGE="${model_ids[$((large_choice-1))]}"
+    else
+        SELECTED_LARGE="${model_ids[$((default_large-1))]}"
+    fi
+
+    local default_small
+    default_small=$(_show_menu small "small model (Haiku)" "$last_small")
+
+    echo ""
+    printf "  Enter number [%s]: " "$default_small"
+    local small_choice
+    small_choice=$(_choose)
+    small_choice="${small_choice:-$default_small}"
+
+    if [[ "$small_choice" =~ ^[0-9]+$ ]] && (( small_choice >= 1 && small_choice <= ${#model_ids[@]} )); then
+        SELECTED_SMALL="${model_ids[$((small_choice-1))]}"
+    else
+        SELECTED_SMALL="${model_ids[$((default_small-1))]}"
+    fi
+
+    echo ""
+    log_info "Large: $SELECTED_LARGE  |  Small: $SELECTED_SMALL"
+    echo ""
+
+    printf '%s\n%s\n' "$SELECTED_LARGE" "$SELECTED_SMALL" > "$LAST_MODEL_FILE"
+}
+
+# ── Settings ────────────────────────────────────────────────────────────
+
+create_temp_settings() {
+    cat > "$TEMP_SETTINGS" <<EOF
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "$PROXY_URL",
+    "ANTHROPIC_AUTH_TOKEN": "$API_KEY",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "$SELECTED_LARGE",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "$SELECTED_LARGE",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$SELECTED_SMALL",
+    "NO_PROXY": "*",
+    "no_proxy": "*",
+    "HTTP_PROXY": "",
+    "HTTPS_PROXY": "",
+    "http_proxy": "",
+    "https_proxy": ""
+  },
+  "model": "sonnet"
+}
+EOF
+}
+
+# ── CLI checks ──────────────────────────────────────────────────────────
+
+check_claude_cli() {
+    if ! command -v claude &>/dev/null; then
+        log_error "Claude Code CLI not found"
+        echo ""
+        echo "Install from: https://claude.ai/code"
+        exit 1
+    fi
+}
+
+check_jq() {
+    if ! command -v jq &>/dev/null; then
+        log_error "jq not found (required for model selection)"
+        echo ""
+        echo "Install with:"
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            echo "  brew install jq"
+        else
+            echo "  sudo apt-get install -y jq"
+        fi
+        exit 1
+    fi
+}
+
+# ── Handle special flags ────────────────────────────────────────────────
+
+case "$1" in
+    --health-check)
+        check_health
+        curl -sf --noproxy '*' "${PROXY_URL}/health" | jq . 2>/dev/null || \
+            curl -sf --noproxy '*' "${PROXY_URL}/health"
+        exit 0
+        ;;
+    --show-config)
+        echo "Remote proxy client configuration:"
+        echo "  Proxy URL: ${PROXY_URL}"
+        echo "  API key:   ${API_KEY}"
+        exit 0
+        ;;
+    --help|-h)
+        echo "Usage: claude-proxy-remote [claude_options]"
+        echo ""
+        echo "Wrapper to launch Claude Code via remote proxy (direct HTTP)."
+        echo ""
+        echo "Options:"
+        echo "  --health-check    Check proxy health"
+        echo "  --show-config     Display connection configuration"
+        echo "  --help, -h        Show this help"
+        echo ""
+        echo "Any other options are passed to claude."
+        exit 0
+        ;;
+esac
+
+# ── Main ────────────────────────────────────────────────────────────────
+
+main() {
+    check_claude_cli
+    check_jq
+    check_health
+    select_models
+    create_temp_settings
+
+    exec claude --settings "$TEMP_SETTINGS" --model sonnet "$@"
+}
+
+main "$@"

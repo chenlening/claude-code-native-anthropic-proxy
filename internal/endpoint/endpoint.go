@@ -39,8 +39,26 @@ type EndpointState struct {
 	lastProbeSuccess bool
 	ProbeModel       string // Backend model name to use in health probes
 
+	// Fallback, when true, means this endpoint is only used when no non-fallback
+	// endpoint supports the requested model.
+	Fallback bool
+
 	// SupportedModels lists the models this endpoint supports
 	SupportedModels []string
+
+	// ExtraModels are statically configured models that supplement discovery
+	ExtraModels []string
+
+	// ConfiguredModels, when set, replaces model discovery — each model is probed
+	// and only working ones are added to SupportedModels.
+	ConfiguredModels []string
+
+	// FailedModels tracks configured models that failed probing, so they can be
+	// re-probed later without re-probing all models.
+	FailedModels []string
+
+	// ModelMap maps proxy model names to backend model names
+	ModelMap map[string]string
 }
 
 // NewEndpointState creates a new endpoint state
@@ -286,12 +304,17 @@ func (e *EndpointState) SetSupportedModels(models []string) {
 	e.mu.Unlock()
 }
 
-// GetSupportedModels returns a copy of the supported models list
+// GetSupportedModels returns a copy of the supported models list, including extra models
+// and model_map frontend names.
 func (e *EndpointState) GetSupportedModels() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	result := make([]string, len(e.SupportedModels))
+	result := make([]string, len(e.SupportedModels), len(e.SupportedModels)+len(e.ExtraModels)+len(e.ModelMap))
 	copy(result, e.SupportedModels)
+	result = append(result, e.ExtraModels...)
+	for frontendName := range e.ModelMap {
+		result = append(result, frontendName)
+	}
 	return result
 }
 
@@ -304,5 +327,59 @@ func (e *EndpointState) SupportsModel(model string) bool {
 			return true
 		}
 	}
-	return false
+	_, inMap := e.ModelMap[model]
+	return inMap
+}
+
+// GetFailedModels returns a copy of the failed models list
+func (e *EndpointState) GetFailedModels() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	result := make([]string, len(e.FailedModels))
+	copy(result, e.FailedModels)
+	return result
+}
+
+// SetFailedModels records which configured models failed probing
+func (e *EndpointState) SetFailedModels(models []string) {
+	e.mu.Lock()
+	e.FailedModels = models
+	e.mu.Unlock()
+}
+
+// AddSupportedModel adds a single model to the supported models list
+func (e *EndpointState) AddSupportedModel(model string) {
+	e.mu.Lock()
+	for _, m := range e.SupportedModels {
+		if m == model {
+			e.mu.Unlock()
+			return // already present
+		}
+	}
+	e.SupportedModels = append(e.SupportedModels, model)
+	e.mu.Unlock()
+}
+
+// RemoveFailedModel removes a model from the failed models list
+func (e *EndpointState) RemoveFailedModel(model string) {
+	e.mu.Lock()
+	for i, m := range e.FailedModels {
+		if m == model {
+			e.FailedModels = append(e.FailedModels[:i], e.FailedModels[i+1:]...)
+			break
+		}
+	}
+	e.mu.Unlock()
+}
+
+// BackendModelFor returns the model name to send to this endpoint's backend.
+// If the frontend name has a mapping in ModelMap, returns the mapped backend name.
+// Otherwise returns the frontend name unchanged.
+func (e *EndpointState) BackendModelFor(frontendModel string) string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if mapped, ok := e.ModelMap[frontendModel]; ok {
+		return mapped
+	}
+	return frontendModel
 }

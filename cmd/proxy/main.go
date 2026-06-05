@@ -14,9 +14,11 @@ import (
 	"github.com/anthropic-transparent-proxy/internal/config"
 	"github.com/anthropic-transparent-proxy/internal/endpoint"
 	"github.com/anthropic-transparent-proxy/internal/healthcheck"
+	"github.com/anthropic-transparent-proxy/internal/memory"
 	"github.com/anthropic-transparent-proxy/internal/metrics"
 	"github.com/anthropic-transparent-proxy/internal/models"
 	"github.com/anthropic-transparent-proxy/internal/proxy"
+	"github.com/anthropic-transparent-proxy/internal/usage"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -57,6 +59,14 @@ func main() {
 	m := metrics.NewMetrics("anthropic_proxy")
 	prometheus.MustRegister(m)
 
+	// Initialize memory client
+	memoryClient := memory.NewClient(
+		cfg.Memory.Mem0URL,
+		cfg.Memory.SearchURL,
+		cfg.Memory.Enabled,
+		logger,
+	)
+
 	// Initialize health manager
 	hm := endpoint.NewHealthManager(endpoint.HealthConfig{
 		FailuresToDisable:     cfg.EndpointHealth.FailuresToDisable,
@@ -75,6 +85,10 @@ func main() {
 		if epCfg.Timeout > 0 {
 			ep.WithTimeout(epCfg.Timeout)
 		}
+		ep.ExtraModels = epCfg.ExtraModels
+		ep.ConfiguredModels = epCfg.Models
+	ep.ModelMap = epCfg.ModelMap
+		ep.Fallback = epCfg.Fallback
 
 		// Use first endpoint model for probe if not set (will be overridden by model discovery)
 		if ep.ProbeModel == "" {
@@ -84,6 +98,24 @@ func main() {
 		hm.AddEndpoint(ep)
 		m.SetEndpointEnabled(name, true)
 	}
+
+	// Initialize usage fetcher
+	usageFetcher := usage.NewFetcherFromConfig(
+		func() map[string]usage.EPInput {
+			eps := make(map[string]usage.EPInput)
+			for name, epCfg := range cfg.Endpoints {
+				if !epCfg.Offline {
+					eps[name] = usage.EPInput{URL: epCfg.URL, APIKey: epCfg.APIKey, VolcesAK: epCfg.VolcesAK, VolcesSK: epCfg.VolcesSK}
+				}
+			}
+			return eps
+		}(),
+	)
+	usageInterval := cfg.Routing.UsageFetchInterval
+	if usageInterval == 0 {
+		usageInterval = 10 * time.Minute
+	}
+	go usageFetcher.Run(usageInterval)
 
 	// Discover supported models via /v1/models (synchronous initial discovery)
 	logger.Info("discovering endpoint model support via /v1/models")
@@ -119,8 +151,26 @@ func main() {
 	stopCh := make(chan struct{})
 	go hm.RunRecoveryProbe(stopCh)
 
-	// Start periodic model discovery refresh
-	go hm.StartModelDiscovery(5*time.Minute, stopCh)
+	// Start failed-model re-probe (always enabled, only re-probes models that
+	// failed initial discovery, not all models)
+	reprobeInterval := cfg.ModelDiscovery.Interval
+	if reprobeInterval == 0 {
+		reprobeInterval = 2 * time.Minute
+	}
+	logger.Info("failed model re-probe enabled", "interval", reprobeInterval)
+	go hm.RunFailedModelReprobe(reprobeInterval, stopCh)
+
+	// Start periodic model discovery refresh (disabled by default)
+	if cfg.ModelDiscovery.Enabled {
+		interval := cfg.ModelDiscovery.Interval
+		if interval == 0 {
+			interval = 5 * time.Minute
+		}
+		logger.Info("periodic model discovery enabled", "interval", interval)
+		go hm.StartModelDiscovery(interval, stopCh)
+	} else {
+		logger.Info("periodic model discovery disabled")
+	}
 
 	// Setup HTTP mux
 	mux := http.NewServeMux()
@@ -130,12 +180,28 @@ func main() {
 	mux.Handle("/v1/models", modelsHandler)
 
 	// Proxy handler
-	proxyHandler := proxy.NewHandler(hm, m, logger)
+	vconn := cfg.Routing.UsageVirtualConnections
+	if vconn == 0 {
+		vconn = 10.0
+	}
+	proxyHandler := proxy.NewHandler(hm, m, memoryClient, usageFetcher, vconn, logger)
 	mux.Handle("/v1/", proxyHandler)
 
 	// Health endpoint
-	healthHandler := healthcheck.NewHandler(hm, m, cfg)
+	healthHandler := healthcheck.NewHandler(hm, m, memoryClient, cfg, usageFetcher)
 	mux.Handle(cfg.Health.Path, healthHandler)
+	mux.Handle(cfg.Health.Path+"/", healthHandler)
+	mux.Handle("/memory", healthHandler)
+	mux.Handle("/memory/", healthHandler)
+
+	// OpenMemory panel reverse proxy (same-origin iframe for DOM access)
+	for _, p := range []string{
+		"/memory-panel/", "/_next/", "/openmemory-api/",
+		"/images/", "/logo.svg", "/memories", "/memories/",
+		"/apps", "/apps/", "/settings", "/settings/",
+	} {
+		mux.Handle(p, healthHandler)
+	}
 
 	// Metrics endpoint
 	if cfg.Metrics.Enabled {
@@ -158,6 +224,7 @@ func main() {
 		sig := <-sigCh
 		logger.Info("received shutdown signal", "signal", sig)
 
+		usageFetcher.Stop()
 		close(stopCh)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

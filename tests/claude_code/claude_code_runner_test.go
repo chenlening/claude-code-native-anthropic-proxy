@@ -40,7 +40,7 @@ func TestClaudeCodeRunner_RunWithInput_SimpleEcho(t *testing.T) {
 	}, "cat")
 
 	// Test subprocess execution with simple input
-	result, err := runner.RunWithInput("hello", 5*time.Second)
+	result, err := runner.RunWithInput("hello", "", 5*time.Second)
 
 	if err != nil {
 		t.Fatalf("RunWithInput failed: %v", err)
@@ -67,7 +67,7 @@ func TestClaudeCodeRunner_RunWithInput_Timeout(t *testing.T) {
 	// Use bash -c with sleep command which will exceed the timeout
 	runner := newClaudeCodeRunnerWithCommand(map[string]string{}, "bash")
 
-	_, err := runner.RunWithInput("sleep 10", 100*time.Millisecond)
+	_, err := runner.RunWithInput("sleep 10", "", 100*time.Millisecond)
 
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
@@ -103,7 +103,7 @@ func TestClaudeCodeRunner_Kill(t *testing.T) {
 		go func() {
 			// Use a command that processes input but won't exit immediately
 			// The trap will catch the signal and exit
-			_, err := runner.RunWithInput("trap 'exit 0' SIGTERM; sleep 1000", 30*time.Second)
+			_, err := runner.RunWithInput("trap 'exit 0' SIGTERM; sleep 1000", "", 30*time.Second)
 			done <- err
 		}()
 
@@ -128,7 +128,7 @@ func TestClaudeCodeRunner_Kill(t *testing.T) {
 	// Test 3: Multiple Kill calls should be safe
 	t.Run("multiple kill calls", func(t *testing.T) {
 		runner := newClaudeCodeRunnerWithCommand(map[string]string{}, "echo")
-		_, _ = runner.RunWithInput("test", 1*time.Second)
+		_, _ = runner.RunWithInput("test", "", 1*time.Second)
 
 		// Multiple kills should not error
 		for i := 0; i < 3; i++ {
