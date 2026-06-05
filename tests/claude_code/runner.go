@@ -3,6 +3,7 @@ package proxytest
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -48,22 +49,27 @@ func newClaudeCodeRunnerWithCommand(env map[string]string, cmd string) *ClaudeCo
 	}
 }
 
-// RunWithInput runs Claude Code as a subprocess with the given input on stdin.
-// Returns the result including exit code, stdout, stderr, and duration.
-func (r *ClaudeCodeRunner) RunWithInput(input string, timeout time.Duration) (*RunResult, error) {
+// RunWithInput runs Claude Code as a subprocess using -p (print/non-interactive) mode.
+// model is passed via --model flag. For custom commands (e.g. cat, bash in tests),
+// input is piped via stdin without -p/--model flags.
+func (r *ClaudeCodeRunner) RunWithInput(input string, model string, timeout time.Duration) (*RunResult, error) {
 	start := time.Now()
 
-	cmd := exec.Command(r.cmd)
+	var cmd *exec.Cmd
+	if r.cmd == "claude" {
+		args := []string{"-p", input}
+		if model != "" {
+			args = append(args, "--model", model)
+		}
+		cmd = exec.Command(r.cmd, args...)
+	} else {
+		// Non-claude commands: pipe input via stdin (for unit tests using cat/bash)
+		cmd = exec.Command(r.cmd)
+	}
 
 	// Set environment variables
 	for key, value := range r.env {
 		cmd.Env = append(cmd.Env, key+"="+value)
-	}
-
-	// Set up stdin pipe
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
 	}
 
 	// Capture stdout and stderr
@@ -71,6 +77,16 @@ func (r *ClaudeCodeRunner) RunWithInput(input string, timeout time.Duration) (*R
 	stderr := &bytes.Buffer{}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+
+	// For non-claude commands, set up stdin pipe
+	var stdinPipe io.WriteCloser
+	if r.cmd != "claude" {
+		pipe, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		stdinPipe = pipe
+	}
 
 	// Start the process
 	if err := cmd.Start(); err != nil {
@@ -89,9 +105,11 @@ func (r *ClaudeCodeRunner) RunWithInput(input string, timeout time.Duration) (*R
 		r.mu.Unlock()
 	}()
 
-	// Write input to stdin
-	stdin.Write([]byte(input))
-	stdin.Close()
+	// Write input to stdin for non-claude commands
+	if stdinPipe != nil {
+		stdinPipe.Write([]byte(input))
+		stdinPipe.Close()
+	}
 
 	// Wait for process completion with timeout
 	done := make(chan error, 1)

@@ -26,6 +26,51 @@ make build
 
 See [docs/macos-install.md](docs/macos-install.md) for launchd-based installation.
 
+## Remote Client
+
+Connect to an existing proxy over SSH — no Go, no build, no local service required. Just the wrapper and an SSH tunnel.
+
+**One-command install:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/2012geek/anthropic-transparent-proxy/main/install-remote.sh | bash
+```
+
+The script prompts for connection details (host, user, password, ports) with sensible defaults. Press Enter to accept each default.
+
+**Non-interactive install (scripted / CI):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/2012geek/anthropic-transparent-proxy/main/install-remote.sh | \
+  REMOTE_HOST=1.2.3.4 SSH_PASS=xxx bash
+```
+
+All configurable env vars:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REMOTE_HOST` | `123.57.174.237` | Remote server IP or hostname |
+| `SSH_USER` | `root` | SSH user |
+| `SSH_PASS` | `Nice@123` | SSH password |
+| `REMOTE_PORT` | `8080` | Proxy port on remote server |
+| `LOCAL_PORT` | `9090` | Local port for SSH tunnel |
+| `API_KEY` | `proxy` | Auth token (proxy replaces this with real key) |
+
+**After install:**
+
+```bash
+# Use this instead of 'claude'
+claude-proxy-remote
+
+# Health check
+claude-proxy-remote --health-check
+
+# Show connection config
+claude-proxy-remote --show-config
+```
+
+The wrapper auto-creates an SSH tunnel each time it runs. Model selection is interactive on first launch and remembered for subsequent sessions.
+
 ## Configuration
 
 Configuration is via YAML file. See `configs/proxy.yaml.example` for a template.

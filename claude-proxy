@@ -12,6 +12,21 @@ NC='\033[0m' # No Color
 
 # Configuration
 PROXY_SERVICE="proxy-anthropic"
+
+# Resolve SCRIPT_DIR to the directory containing this script (follows symlinks)
+_resolve_script_dir() {
+    local src="$0"
+    if command -v greadlink &>/dev/null; then
+        src="$(greadlink -f "$0")"
+    elif command -v readlink &>/dev/null && readlink -f "$0" &>/dev/null 2>&1; then
+        src="$(readlink -f "$0")"
+    fi
+    cd "$(dirname "$src")" && pwd
+}
+SCRIPT_DIR="$(_resolve_script_dir)"
+
+# CONFIG_FILE is resolved in find_config_file — relative paths resolve against
+# SCRIPT_DIR first (repo-relative), then CWD, then absolute fallback paths.
 CONFIG_FILE="configs/proxy.yaml"
 FALLBACK_CONFIG="/etc/anthropic-transparent-proxy/proxy.yaml"
 DEFAULT_BASE_URL="http://localhost:8080"
@@ -39,7 +54,20 @@ log_warn() {
 }
 
 check_proxy_service() {
-    if ! systemctl is-active --quiet "$PROXY_SERVICE" 2>/dev/null; then
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS: check launchd
+        if ! launchctl list | grep -q "com.anthropic.proxy"; then
+            log_error "Proxy service not running"
+            echo ""
+            echo "Start the proxy service with:"
+            echo "  launchctl load ~/Library/LaunchAgents/com.anthropic.proxy.plist"
+            echo ""
+            echo "Check service status:"
+            echo "  launchctl list | grep com.anthropic.proxy"
+            exit 1
+        fi
+        log_info "Proxy service: active (com.anthropic.proxy)"
+    elif ! systemctl is-active --quiet "$PROXY_SERVICE" 2>/dev/null; then
         log_error "Proxy service not running"
         echo ""
         echo "Start the proxy service with:"
@@ -48,8 +76,9 @@ check_proxy_service() {
         echo "Check service status:"
         echo "  systemctl status $PROXY_SERVICE"
         exit 1
+    else
+        log_info "Proxy service: active ($PROXY_SERVICE)"
     fi
-    log_info "Proxy service: active ($PROXY_SERVICE)"
 }
 
 check_health_endpoint() {
@@ -58,8 +87,13 @@ check_health_endpoint() {
         log_error "Proxy not responding at $base_url"
         echo ""
         echo "Troubleshooting:"
-        echo "  1. Check proxy logs: journalctl -u $PROXY_SERVICE -n 20"
-        echo "  2. Restart proxy: sudo systemctl restart $PROXY_SERVICE"
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            echo "  1. Check proxy logs: tail -50 /tmp/proxy-anthropic.log"
+            echo "  2. Restart proxy: launchctl unload ~/Library/LaunchAgents/com.anthropic.proxy.plist && launchctl load ~/Library/LaunchAgents/com.anthropic.proxy.plist"
+        else
+            echo "  1. Check proxy logs: journalctl -u $PROXY_SERVICE -n 20"
+            echo "  2. Restart proxy: sudo systemctl restart $PROXY_SERVICE"
+        fi
         echo "  3. Verify config: $CONFIG_FILE"
         exit 1
     fi
@@ -67,18 +101,33 @@ check_health_endpoint() {
 }
 
 find_config_file() {
-    if [[ -f "$CONFIG_FILE" ]]; then
-        echo "$CONFIG_FILE"
+    # Resolve CONFIG_FILE: try absolute path first, then relative to script dir,
+    # then relative to CWD, then fallback path.
+    local resolved=""
+
+    if [[ "$CONFIG_FILE" == /* ]] && [[ -f "$CONFIG_FILE" ]]; then
+        # Absolute path (set at install time)
+        resolved="$CONFIG_FILE"
+    elif [[ -f "$SCRIPT_DIR/$CONFIG_FILE" ]]; then
+        # Relative to the wrapper script's location
+        resolved="$SCRIPT_DIR/$CONFIG_FILE"
+    elif [[ "$PWD" != "$SCRIPT_DIR" ]] && [[ -f "$PWD/$CONFIG_FILE" ]]; then
+        # Relative to current working directory (secondary)
+        resolved="$PWD/$CONFIG_FILE"
     elif [[ -f "$FALLBACK_CONFIG" ]]; then
-        echo "$FALLBACK_CONFIG"
+        resolved="$FALLBACK_CONFIG"
     else
         log_error "Configuration file not found"
         echo ""
-        echo "Expected locations:"
-        echo "  1. $CONFIG_FILE"
-        echo "  2. $FALLBACK_CONFIG"
+        echo "Looked for config at:"
+        [[ "$CONFIG_FILE" == /* ]] && echo "  1. $CONFIG_FILE (absolute, not found)"
+        echo "  2. $SCRIPT_DIR/$CONFIG_FILE (relative to script, not found)"
+        echo "  3. $PWD/$CONFIG_FILE (relative to CWD, not found)"
+        echo "  4. $FALLBACK_CONFIG (fallback, not found)"
         exit 1
     fi
+
+    echo "$resolved"
 }
 
 extract_api_key() {
@@ -143,8 +192,12 @@ extract_models() {
 LAST_MODEL_FILE="$HOME/.claude-proxy-last"
 
 # Classify models as large (Opus/Sonnet) or small (Haiku) by naming patterns
+# Uses case statement for bash 3.2 compatibility (no =~ regex)
 _is_small_model() {
-    [[ "$1" =~ flash|turbo|highspeed|air$|air-|-air|lite$|mini$|haiku ]]
+    case "$1" in
+        *flash*|*turbo*|*highspeed*|*air|*lite*|*mini*|*haiku*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 select_models() {
@@ -268,6 +321,12 @@ check_claude_cli() {
 display_config() {
     local base_url="$1"
     local models="$2"
+    local service_name
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        service_name="com.anthropic.proxy"
+    else
+        service_name="$PROXY_SERVICE"
+    fi
 
     echo ""
     echo "Configuration:"
@@ -275,7 +334,7 @@ display_config() {
     if [[ -n "$models" ]]; then
         echo "  Models: $models"
     fi
-    echo "  Service: $PROXY_SERVICE"
+    echo "  Service: $service_name"
     echo ""
 }
 
@@ -293,7 +352,8 @@ create_temp_settings() {
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "$large_model",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$large_model",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$small_model"
-  }
+  },
+  "model": "sonnet"
 }
 EOF
 }
@@ -354,8 +414,19 @@ main() {
     # Create temporary settings file with proxy configuration
     create_temp_settings "$base_url" "$api_key" "$SELECTED_LARGE" "$SELECTED_SMALL"
 
+    # Export model env vars directly (shell env takes highest priority over --settings)
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="$SELECTED_LARGE"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="$SELECTED_LARGE"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$SELECTED_SMALL"
+
+    # Unset direct model overrides so category-based selection works
+    unset ANTHROPIC_MODEL
+    unset ANTHROPIC_SMALL_FAST_MODEL
+
     # Launch Claude Code with temporary settings (only affects this session)
-    exec claude --settings "$TEMP_SETTINGS" "$@"
+    export ANTHROPIC_BASE_URL="$base_url"
+    export ANTHROPIC_AUTH_TOKEN="$api_key"
+    exec claude --settings "$TEMP_SETTINGS" --model sonnet "$@"
 }
 
 main "$@"

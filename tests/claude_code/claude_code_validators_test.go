@@ -136,11 +136,11 @@ func TestValidateExtendedThinking_NonZeroExitCode(t *testing.T) {
 func TestValidateExtendedThinking_NoThinkingBlocks(t *testing.T) {
 	result := &RunResult{
 		ExitCode: 0,
-		Stdout:   "just regular text without thinking",
+		Stdout:   "pong",
 		Stderr:   "",
 	}
 	err := ValidateExtendedThinking(result)
 	if err == nil {
-		t.Error("expected error for missing thinking blocks")
+		t.Error("expected error for missing reasoning content")
 	}
 }

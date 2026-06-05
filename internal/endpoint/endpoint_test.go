@@ -285,3 +285,38 @@ func TestVerify(t *testing.T) {
 		}
 	})
 }
+func TestGetSupportedModelsIncludesModelMapKeys(t *testing.T) {
+	ep := NewEndpointState("test", "http://example.com", "key", "")
+	ep.SetSupportedModels([]string{"GLM-5", "GLM-5.1"})
+	ep.ModelMap = map[string]string{"glm-5": "GLM-5", "glm-5.1": "GLM-5.1"}
+
+	models := ep.GetSupportedModels()
+
+	hasGLM5 := false
+	hasGlm5 := false
+	for _, m := range models {
+		if m == "GLM-5" { hasGLM5 = true }
+		if m == "glm-5" { hasGlm5 = true }
+	}
+	if !hasGLM5 { t.Error("expected GLM-5 in supported models") }
+	if !hasGlm5 { t.Error("expected glm-5 (model_map key) in supported models") }
+}
+
+func TestBackendModelFor(t *testing.T) {
+	ep := NewEndpointState("test", "http://example.com", "key", "")
+	ep.SetSupportedModels([]string{"GLM-5", "GLM-5.1"})
+	ep.ModelMap = map[string]string{"glm-5": "GLM-5", "glm-5.1": "GLM-5.1"}
+
+	// Frontend name mapped to backend name
+	if got := ep.BackendModelFor("glm-5"); got != "GLM-5" {
+		t.Errorf("BackendModelFor(glm-5) = %q, want GLM-5", got)
+	}
+	// Native name with no mapping — returns itself
+	if got := ep.BackendModelFor("GLM-5"); got != "GLM-5" {
+		t.Errorf("BackendModelFor(GLM-5) = %q, want GLM-5", got)
+	}
+	// Unknown model — returns itself
+	if got := ep.BackendModelFor("unknown"); got != "unknown" {
+		t.Errorf("BackendModelFor(unknown) = %q, want unknown", got)
+	}
+}

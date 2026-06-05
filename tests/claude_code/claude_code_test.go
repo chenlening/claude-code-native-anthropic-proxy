@@ -2,7 +2,6 @@ package proxytest
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -29,11 +28,11 @@ func TestClaudeCodeBasicChat(t *testing.T) {
 	}
 
 	runner := NewClaudeCodeRunner(map[string]string{
-		"ANTHROPIC_BASE_URL": "http://localhost:8080",
+		"ANTHROPIC_BASE_URL":  "http://localhost:8080",
+		"ANTHROPIC_API_KEY":   "dummy",
 	})
 
-	input := fmt.Sprintf("Say 'hello' and nothing else. Use model: %s", model)
-	result, err := runner.RunWithInput(input, 5*time.Minute)
+	result, err := runner.RunWithInput("Say 'hello' and nothing else.", model, 5*time.Minute)
 
 	if err != nil {
 		t.Fatalf("basic chat test failed: %v", err)
@@ -59,11 +58,11 @@ func TestClaudeCodeToolUse(t *testing.T) {
 	}
 
 	runner := NewClaudeCodeRunner(map[string]string{
-		"ANTHROPIC_BASE_URL": "http://localhost:8080",
+		"ANTHROPIC_BASE_URL":  "http://localhost:8080",
+		"ANTHROPIC_API_KEY":   "dummy",
 	})
 
-	input := fmt.Sprintf("!ls -la. Use model: %s", model)
-	result, err := runner.RunWithInput(input, 5*time.Minute)
+	result, err := runner.RunWithInput("!ls -la", model, 5*time.Minute)
 
 	if err != nil {
 		t.Fatalf("tool use test failed: %v", err)
@@ -89,11 +88,11 @@ func TestClaudeCodeExtendedThinking(t *testing.T) {
 	}
 
 	runner := NewClaudeCodeRunner(map[string]string{
-		"ANTHROPIC_BASE_URL": "http://localhost:8080",
+		"ANTHROPIC_BASE_URL":  "http://localhost:8080",
+		"ANTHROPIC_API_KEY":   "dummy",
 	})
 
-	input := fmt.Sprintf("Think step by step: what is 2+2? Show your reasoning in thinking blocks. Use model: %s", model)
-	result, err := runner.RunWithInput(input, 5*time.Minute)
+	result, err := runner.RunWithInput("Think step by step: what is 2+2? Show your reasoning.", model, 5*time.Minute)
 
 	if err != nil {
 		t.Fatalf("extended thinking test failed: %v", err)
@@ -107,8 +106,6 @@ func TestClaudeCodeExtendedThinking(t *testing.T) {
 // TestClaudeCodeErrorRecovery validates that the proxy can handle multiple endpoints
 // and route requests appropriately when some endpoints are unavailable. This test
 // requires at least 2 enabled endpoints configured in the proxy configuration.
-// To test actual error recovery, manually configure one endpoint as offline in
-// configs/proxy.yaml and verify that requests still succeed using remaining endpoints.
 func TestClaudeCodeErrorRecovery(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping Claude Code integration test in short mode")
@@ -118,7 +115,6 @@ func TestClaudeCodeErrorRecovery(t *testing.T) {
 		return
 	}
 
-	// Check if multiple endpoints are available
 	health, err := getProxyHealth(t)
 	if err != nil {
 		t.Skip("failed to get proxy health")
@@ -135,7 +131,7 @@ func TestClaudeCodeErrorRecovery(t *testing.T) {
 	t.Logf("Found %d enabled endpoints, require at least 2 for error recovery test", enabledEndpoints)
 
 	if enabledEndpoints < 2 {
-		t.Skipf("error recovery test requires multiple enabled endpoints (found %d, need 2+). Manual setup: mark one endpoint as offline in configs/proxy.yaml to test failover behavior", enabledEndpoints)
+		t.Skipf("error recovery test requires multiple enabled endpoints (found %d, need 2+)", enabledEndpoints)
 		return
 	}
 
@@ -145,11 +141,11 @@ func TestClaudeCodeErrorRecovery(t *testing.T) {
 	}
 
 	runner := NewClaudeCodeRunner(map[string]string{
-		"ANTHROPIC_BASE_URL": "http://localhost:8080",
+		"ANTHROPIC_BASE_URL":  "http://localhost:8080",
+		"ANTHROPIC_API_KEY":   "dummy",
 	})
 
-	input := fmt.Sprintf("Say 'error recovery test passed'. Use model: %s", model)
-	result, err := runner.RunWithInput(input, 5*time.Minute)
+	result, err := runner.RunWithInput("Say 'error recovery test passed'.", model, 5*time.Minute)
 
 	if err != nil {
 		t.Fatalf("error recovery test failed: %v", err)
@@ -159,7 +155,6 @@ func TestClaudeCodeErrorRecovery(t *testing.T) {
 		t.Errorf("error recovery validation failed: %v", err)
 	}
 
-	// After the request completes, check health to see if endpoints were used
 	healthAfter, err := getProxyHealth(t)
 	if err != nil {
 		t.Logf("Could not verify endpoint usage after request: %v", err)
@@ -184,9 +179,9 @@ func TestClaudeCodeConcurrentRequests(t *testing.T) {
 
 	numConcurrent := 3
 	inputs := []string{
-		fmt.Sprintf("Say 'test 1 passed'. Use model: %s", model),
-		fmt.Sprintf("Say 'test 2 passed'. Use model: %s", model),
-		fmt.Sprintf("Say 'test 3 passed'. Use model: %s", model),
+		"Say 'test 1 passed'.",
+		"Say 'test 2 passed'.",
+		"Say 'test 3 passed'.",
 	}
 
 	results := make(chan *RunResult, numConcurrent)
@@ -195,10 +190,11 @@ func TestClaudeCodeConcurrentRequests(t *testing.T) {
 	for i := 0; i < numConcurrent; i++ {
 		go func(idx int) {
 			runner := NewClaudeCodeRunner(map[string]string{
-				"ANTHROPIC_BASE_URL": "http://localhost:8080",
+				"ANTHROPIC_BASE_URL":  "http://localhost:8080",
+				"ANTHROPIC_API_KEY":   "dummy",
 			})
 
-			result, err := runner.RunWithInput(inputs[idx], 5*time.Minute)
+			result, err := runner.RunWithInput(inputs[idx], model, 5*time.Minute)
 			if err != nil {
 				errors <- err
 				return
@@ -207,7 +203,6 @@ func TestClaudeCodeConcurrentRequests(t *testing.T) {
 		}(i)
 	}
 
-	// Collect results with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 

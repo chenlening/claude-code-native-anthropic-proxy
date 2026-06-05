@@ -75,6 +75,18 @@ func ValidateAvailableModels(t *testing.T, proxyURL string) string {
 		return ""
 	}
 
+	// Prefer fast, reliable models over slow ones. Pick the first match
+	// from a preference list, falling back to the first available model.
+	preferred := []string{"glm-5-turbo", "glm-5.1", "glm-4.5-air", "deepseek-v4-flash", "deepseek-v4-pro"}
+	for _, pref := range preferred {
+		for _, m := range modelsResp.Data {
+			if m.ID == pref {
+				t.Logf("Using model: %s (preferred)", m.ID)
+				return m.ID
+			}
+		}
+	}
+
 	t.Logf("Using model: %s", modelsResp.Data[0].ID)
 	return modelsResp.Data[0].ID
 }
